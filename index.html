@@ -813,7 +813,11 @@ Black Lotus"></textarea>
             <button type="button" onclick="addCardFromSearch()" style="margin:0;padding:5px 10px;">LISÄÄ</button>
           </div>
           <datalist id="addCardSuggestions"></datalist>
-          <div id="addCardInfo" class="small-note">Kirjoita nimi — Scryfall ehdottaa kortteja reaaliajassa.</div>
+          <label class="small-note" style="display:flex;align-items:center;gap:5px;margin-top:4px;cursor:pointer;">
+            <input type="checkbox" id="addCardAutocompleteToggle" onchange="handleDeckCardAutocompleteToggle('add')" style="margin:0;">
+            <span>NIMIEHDOTUKSET</span>
+          </label>
+          <div id="addCardInfo" class="small-note">Kirjoita kortin nimi kokonaan.</div>
         </div>
 
         <button class="menu-button" type="button" onclick="openDeckListDialog()">LISÄÄ KORTTILISTA</button>
@@ -1108,6 +1112,10 @@ Black Lotus"></textarea>
       <label for="replaceDeckCardSearchInput"><b>VAIHDA VALITTU KORTTI</b></label>
       <input type="text" id="replaceDeckCardSearchInput" list="replaceDeckCardSuggestions" placeholder="Kirjoita kortin nimi..." autocomplete="off" oninput="scheduleDeckCardAutocomplete('replace')" onkeydown="if(event.key==='Enter'){event.preventDefault();replaceSelectedDeckCard();}">
       <datalist id="replaceDeckCardSuggestions"></datalist>
+      <label class="small-note" style="display:flex;align-items:center;gap:5px;margin:4px 0;cursor:pointer;">
+        <input type="checkbox" id="replaceDeckCardAutocompleteToggle" onchange="handleDeckCardAutocompleteToggle('replace')" style="margin:0;">
+        <span>NIMIEHDOTUKSET</span>
+      </label>
       <button id="deckReplaceBtn" type="button" onclick="replaceSelectedDeckCard()" disabled>VAIHDA</button>
       <div id="replaceDeckCardInfo" class="small-note">Valitse ensin thumbnail yhdellä klikkauksella.</div>
     </div>
@@ -5658,7 +5666,12 @@ async function loadDeckList() {
             renderDeckGrid();
             await new Promise(resolve => requestAnimationFrame(resolve));
 
-            if (i < uniqueSpecs.length - 1) await sleep(140);
+            if (i < uniqueSpecs.length - 1) {
+                // Pitkillä listoilla katkaistaan Scryfall-pyyntöjen sarja säännöllisesti.
+                // Normaali pieni väli jokaisen kortin jälkeen, ja joka viidennen jälkeen
+                // kokonainen sekunti. Tämä vähentää selain-/verkko- ja rate-limit -piikkejä.
+                await sleep(((i + 1) % 5 === 0) ? 1000 : 140);
+            }
         }
     } finally {
         suppressDeckSync = false;
@@ -6802,6 +6815,27 @@ async function backToDeck() {
     showDeckView();
 }
 
+function isDeckCardAutocompleteEnabled(kind) {
+    const toggleId = kind === "replace" ? "replaceDeckCardAutocompleteToggle" : "addCardAutocompleteToggle";
+    return !!document.getElementById(toggleId)?.checked;
+}
+
+function clearDeckCardAutocomplete(kind) {
+    const listId = kind === "replace" ? "replaceDeckCardSuggestions" : "addCardSuggestions";
+    const list = document.getElementById(listId);
+    if (list) list.innerHTML = "";
+}
+
+function handleDeckCardAutocompleteToggle(kind) {
+    if (deckCardAutocompleteTimer) { clearTimeout(deckCardAutocompleteTimer); deckCardAutocompleteTimer = null; }
+    ++deckCardAutocompleteRequestId;
+    if (!isDeckCardAutocompleteEnabled(kind)) {
+        clearDeckCardAutocomplete(kind);
+        return;
+    }
+    scheduleDeckCardAutocomplete(kind);
+}
+
 async function updateDeckCardAutocomplete(kind) {
     const inputId = kind === "replace" ? "replaceDeckCardSearchInput" : "addCardSearchInput";
     const listId = kind === "replace" ? "replaceDeckCardSuggestions" : "addCardSuggestions";
@@ -6809,6 +6843,7 @@ async function updateDeckCardAutocomplete(kind) {
     const list = document.getElementById(listId);
     const q = String(input?.value || "").trim();
     if (!list) return;
+    if (!isDeckCardAutocompleteEnabled(kind)) { list.innerHTML = ""; return; }
     if (q.length < 2) { list.innerHTML=""; return; }
     const req = ++deckCardAutocompleteRequestId;
     try {
@@ -6825,6 +6860,11 @@ async function updateDeckCardAutocomplete(kind) {
 
 function scheduleDeckCardAutocomplete(kind) {
     if (deckCardAutocompleteTimer) clearTimeout(deckCardAutocompleteTimer);
+    if (!isDeckCardAutocompleteEnabled(kind)) {
+        deckCardAutocompleteTimer = null;
+        clearDeckCardAutocomplete(kind);
+        return;
+    }
     deckCardAutocompleteTimer=setTimeout(()=>updateDeckCardAutocomplete(kind),220);
 }
 
@@ -8243,8 +8283,8 @@ const UI_TEXT_MAP = {
     "DEKKILISTA / KORTTINIMET": ["DEKKILISTA / KORTTINIMET", "DECKLIST / CARD NAMES"],
     "PERUUTA": ["PERUUTA", "CANCEL"], "LOAD": ["LATAA", "LOAD"],
     "KORTIT JA TALLENNUS": ["KORTIT JA TALLENNUS", "CARDS & EXPORT"],
-    "LISÄÄ KORTTI": ["LISÄÄ KORTTI", "ADD CARD"], "LISÄÄ": ["LISÄÄ", "ADD"],
-    "Kirjoita nimi — Scryfall ehdottaa kortteja reaaliajassa.": ["Kirjoita nimi — Scryfall ehdottaa kortteja reaaliajassa.", "Type a name — Scryfall suggests cards in real time."],
+    "LISÄÄ KORTTI": ["LISÄÄ KORTTI", "ADD CARD"], "LISÄÄ": ["LISÄÄ", "ADD"], "NIMIEHDOTUKSET": ["NIMIEHDOTUKSET", "NAME SUGGESTIONS"],
+    "Kirjoita kortin nimi kokonaan.": ["Kirjoita kortin nimi kokonaan.", "Type the full card name."],
     "LISÄÄ KORTTILISTA": ["LISÄÄ KORTTILISTA", "ADD DECKLIST"],
     "Ei korttilistaa ladattu.": ["Ei korttilistaa ladattu.", "No decklist loaded."],
     "PALAUTA EDELLINEN LISTA": ["PALAUTA EDELLINEN LISTA", "RESTORE PREVIOUS LIST"],
