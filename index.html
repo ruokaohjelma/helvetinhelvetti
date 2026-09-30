@@ -1134,28 +1134,88 @@ Black Lotus"></textarea>
 // Vanha POSTreq-polyfill rikkoi paikallisen käytön joissakin selaimissa.
 const browserFetch = window.fetch.bind(window);
 
+let scryfallRequestChain = Promise.resolve();
+let scryfallNextRequestAt = 0;
+
+async function paceRemoteJSONRequest(url) {
+    // Kaikki Scryfall-JSON-kutsut kulkevat yhden jonon kautta. Näin myös
+    // mahdollinen autocomplete tai muu rinnakkainen haku ei voi tehdä piikkiä.
+    if (!/^https:\/\/api\.scryfall\.com\//i.test(String(url || ""))) return;
+    let release;
+    const previous = scryfallRequestChain;
+    scryfallRequestChain = new Promise(resolve => { release = resolve; });
+    await previous;
+    try {
+        const wait = Math.max(0, scryfallNextRequestAt - Date.now());
+        if (wait) await sleep(wait);
+        // Noin 6 pyyntöä/s maksimissaan, selvästi alle Scryfallin 10/s-ohjeen.
+        scryfallNextRequestAt = Date.now() + 165;
+    } finally {
+        release();
+    }
+}
+
+function remoteRetryDelayMs(response, attempt) {
+    const retryAfter = response?.headers?.get?.("Retry-After");
+    if (retryAfter) {
+        const seconds = Number(retryAfter);
+        if (Number.isFinite(seconds)) return Math.max(1000, seconds * 1000);
+        const dateMs = Date.parse(retryAfter);
+        if (Number.isFinite(dateMs)) return Math.max(1000, dateMs - Date.now());
+    }
+    return Math.min(8000, 800 * Math.pow(2, attempt));
+}
+
 async function remoteJSONFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
     if (!headers.has("Accept")) {
         headers.set("Accept", "application/json;q=0.9,*/*;q=0.8");
     }
 
-    const controller = new AbortController();
-    const timeoutMs = options.timeoutMs || 15000;
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutMs = Number(options.timeoutMs) || 20000;
+    const maxAttempts = Math.max(1, Number(options.maxAttempts) || 5);
+    const fetchOptions = { ...options };
+    delete fetchOptions.timeoutMs;
+    delete fetchOptions.maxAttempts;
+    delete fetchOptions.signal;
 
-    try {
-        return await browserFetch(url, {
-            ...options,
-            headers,
-            mode: "cors",
-            credentials: "omit",
-            referrerPolicy: "no-referrer",
-            signal: controller.signal
-        });
-    } finally {
-        clearTimeout(timer);
+    const retryStatuses = new Set([408, 425, 429, 500, 502, 503, 504]);
+    let lastError = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await paceRemoteJSONRequest(url);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await browserFetch(url, {
+                ...fetchOptions,
+                headers,
+                mode: "cors",
+                credentials: "omit",
+                referrerPolicy: "no-referrer",
+                signal: controller.signal
+            });
+
+            if (!retryStatuses.has(response.status) || attempt === maxAttempts - 1) {
+                return response;
+            }
+
+            const delay = remoteRetryDelayMs(response, attempt);
+            console.warn(`Tilapäinen HTTP ${response.status}; yritetään uudelleen ${Math.round(delay/100)/10}s kuluttua:`, url);
+            await sleep(delay);
+        } catch (e) {
+            lastError = e;
+            const retryable = e?.name === "AbortError" || e instanceof TypeError || /network|fetch|timeout|aikakat/i.test(String(e?.message || e));
+            if (!retryable || attempt === maxAttempts - 1) throw e;
+            const delay = Math.min(8000, 800 * Math.pow(2, attempt));
+            console.warn(`Tilapäinen verkkovirhe; yritetään uudelleen ${Math.round(delay/100)/10}s kuluttua:`, url, e);
+            await sleep(delay);
+        } finally {
+            clearTimeout(timer);
+        }
     }
+
+    throw lastError || new Error("Verkkopyyntö epäonnistui");
 }
 
 const canvas = document.getElementById("cardCanvas");
@@ -1377,11 +1437,25 @@ async function fetchMTGJSONPrintedText(oldestPrint) {
             const url = `https://mtgjson.com/api/v5/${encodeURIComponent(setCode)}.json`;
             const response = await remoteJSONFetch(url);
             if (!response.ok) throw new Error(`MTGJSON ${setCode}: HTTP ${response.status}`);
-            mtgjsonSetCache[setCode] = await response.json();
+            const setData = await response.json();
+            const rawCards = setData?.data?.cards || [];
+
+            // Älä pidä selaimen muistissa kokonaisia MTGJSON-settitiedostoja.
+            // Importissa tarvitaan niistä vain nämä muutamat printed/original-kentät.
+            mtgjsonSetCache[setCode] = rawCards.map(card => ({
+                identifiers: { scryfallId: card?.identifiers?.scryfallId || "" },
+                number: card?.number ?? "",
+                name: card?.name ?? "",
+                printedText: card?.printedText,
+                originalText: card?.originalText,
+                text: card?.text,
+                printedType: card?.printedType,
+                originalType: card?.originalType,
+                type: card?.type
+            }));
         }
 
-        const setData = mtgjsonSetCache[setCode];
-        const cards = setData?.data?.cards || [];
+        const cards = mtgjsonSetCache[setCode] || [];
         let exact = cards.find(card => card?.identifiers?.scryfallId === oldestPrint.id);
 
         // Joissain erikoispainoksissa identifier voi puuttua tai poiketa.
@@ -1637,6 +1711,7 @@ async function fetchOldestPaperPrint(latestCard) {
 }
 
 async function fetchCardData(cardName) {
+    window.lastCardFetchError = null;
     const cacheKey = cardName.toLowerCase().trim();
     if (localCache[cacheKey]) return localCache[cacheKey];
 
@@ -1644,12 +1719,17 @@ async function fetchCardData(cardName) {
         const exactUrl = `https://api.scryfall.com/cards/named?exact=${encodeURIComponent(cardName)}`;
         let response = await remoteJSONFetch(exactUrl);
 
-        if (!response.ok) {
+        // Fuzzy-haku tehdään vain aidolle 404:lle. Rate limit, timeout tai
+        // palvelinvirhe ei saa näyttää käyttäjälle valheellisesti "ei löytynyt".
+        if (response.status === 404) {
             const fuzzyUrl = `https://api.scryfall.com/cards/named?fuzzy=${encodeURIComponent(cardName)}`;
             response = await remoteJSONFetch(fuzzyUrl);
         }
 
-        if (!response.ok) throw new Error("Korttia ei löytynyt");
+        if (!response.ok) {
+            if (response.status === 404) throw new Error("Korttia ei löytynyt");
+            throw new Error(`Scryfall-haku epäonnistui (HTTP ${response.status})`);
+        }
 
         const latestCard = await response.json();
         // Pieni väli pitää dekkilatauksen Scryfallin pyyntömäärän maltillisena.
@@ -1742,6 +1822,12 @@ async function fetchCardData(cardName) {
         return result;
     } catch (e) {
         console.warn("Scryfall-haku epäonnistui:", e);
+        const message = String(e?.message || e || "Tuntematon virhe");
+        window.lastCardFetchError = {
+            cardName,
+            kind: /Korttia ei löytynyt/i.test(message) ? "not_found" : "temporary",
+            message
+        };
         return null;
     }
 }
@@ -7134,6 +7220,7 @@ async function loadDeckList() {
     const uniqueSpecs=[]; const seen=new Set();
     for(const spec of specs){const k=normalizeCardName(spec.name);if(!seen.has(k)){seen.add(k);uniqueSpecs.push(spec);}}
     const failures=[];
+    const loadErrors=[];
 
     suppressDeckSync=true; currentDeckEntryId=null; selectedDeckEntryId=null; deckEntries=[]; designCounter=1; entryCounter=1;
     window.deckMultiSelectMode=false; window.deckMultiSelectedIds?.clear?.();
@@ -7145,7 +7232,13 @@ async function loadDeckList() {
             const spec=uniqueSpecs[i];
             setDeckStatus(uiText(`Ladataan ${i+1}/${uniqueSpecs.length}: ${spec.name}`,`Loading ${i+1}/${uniqueSpecs.length}: ${spec.name}`));
             try{
-                const result=await fetchCardData(spec.name); if(!result){failures.push(spec.name);continue;}
+                const result=await fetchCardData(spec.name);
+                if(!result){
+                    const fetchErr = window.lastCardFetchError;
+                    if (fetchErr?.kind === "not_found") failures.push(spec.name);
+                    else loadErrors.push(`${spec.name}: ${fetchErr?.message || "verkkohaku epäonnistui"}`);
+                    continue;
+                }
                 const expanded=expandFetchedResultToDeckCards(result);
                 const isDFC=expanded.length===2 && isSeparateDoubleFacedCard(result.sourceOracleCard || result.oracle);
                 const parentCardName=result.sourceOracleCard?.name || result.oracle?.name || spec.name;
@@ -7196,16 +7289,31 @@ async function loadDeckList() {
                         });
                     }
                 }
-                renderDeckGrid();
-                await new Promise(r=>requestAnimationFrame(r));
-                if(i<uniqueSpecs.length-1) await sleep(120);
-            }catch(e){console.warn("Kortin lataus epäonnistui",spec.name,e);failures.push(spec.name);}
+                // Pitkällä listalla koko thumbnail-gridin uudelleenrakennus jokaisen
+                // kortin jälkeen tekee turhaa O(n²)-DOM-työtä. Päivitä näkyvä lista
+                // viiden kortin erissä (ja lopussa), statusrivi päivittyy silti joka kortilla.
+                if (((i + 1) % 5 === 0) || i === uniqueSpecs.length - 1) {
+                    renderDeckGrid();
+                    await new Promise(r=>requestAnimationFrame(r));
+                }
+                if(i<uniqueSpecs.length-1) {
+                    // Aktiivinen importteri: 1 s hengähdystauko joka viidennen kortin jälkeen.
+                    await sleep(((i + 1) % 5 === 0) ? 1000 : 140);
+                }
+            }catch(e){
+                console.warn("Kortin lataus epäonnistui",spec.name,e);
+                loadErrors.push(`${spec.name}: ${String(e?.message || e || "tuntematon virhe")}`);
+            }
         }
     }finally{ suppressDeckSync=false; deckLoadRunning=false; if(loadBtn) loadBtn.disabled=false; }
     if(!deckEntries.length){setDeckStatus(uiText("Yhtään korttia ei saatu ladattua.","No cards could be loaded."),true);alert(uiText("Yhtään listan korttia ei saatu ladattua.","No cards from the list could be loaded."));return;}
     showDeckView(); renderDeckGrid(); updateDeckLockUI(); updateDeckMultiSelectUI();
     rememberCurrentDeckList();
-    setDeckStatus(uiText(`${deckEntries.length} korttia listassa.${failures.length?` Ei löytynyt: ${[...new Set(failures)].join(", ")}.`:""}`,`${deckEntries.length} cards in list.${failures.length?` Not found: ${[...new Set(failures)].join(", ")}.`:""}`),failures.length>0);
+    const uniqueLoadErrors=[...new Set(loadErrors)];
+    setDeckStatus(uiText(
+        `${deckEntries.length} korttia listassa.${failures.length?` Ei löytynyt: ${[...new Set(failures)].join(", ")}.`:""}${uniqueLoadErrors.length?` Tilapäinen latausvirhe: ${uniqueLoadErrors.join(" | ")}.`:""}`,
+        `${deckEntries.length} cards in list.${failures.length?` Not found: ${[...new Set(failures)].join(", ")}.`:""}${uniqueLoadErrors.length?` Temporary load error: ${uniqueLoadErrors.join(" | ")}.`:""}`
+    ), failures.length>0 || uniqueLoadErrors.length>0);
 }
 
 async function renderDeckEntryToPngData(entry,width=744,height=1039) {
@@ -7493,26 +7601,41 @@ async function loadImage(url, timeoutMs = 15000) {
         !/^(?:data:|blob:|https?:\/\/|file:)/i.test(safeSrc)) {
         safeSrc = await localAssetToDataURL(safeSrc);
     }
-    if (/^https?:\/\//i.test(safeSrc)) {
-        try { safeSrc = await remoteImageToDataURL(safeSrc, timeoutMs); }
-        catch (e) { console.warn("Etäkuvaa ei saatu data-URL:ksi; kokeillaan CORS-kuvana:", e); }
-    }
+
     const cacheKey = (isRemote ? "REMOTE|" : (exportSafeLocalAssetMode ? "LOCALSAFE|" : "LOCAL|")) + originalUrl;
     if (decodedImageCache.has(cacheKey)) {
         const cached = decodedImageCache.get(cacheKey);
         if (isRemote) { decodedImageCache.delete(cacheKey); decodedImageCache.set(cacheKey, cached); }
         return cached;
     }
-    const img = await new Promise((resolve,reject) => {
+
+    const decodeImage = (src, useCors) => new Promise((resolve,reject) => {
         const image = new Image();
-        if (/^https?:\/\//i.test(safeSrc)) image.crossOrigin = "anonymous";
+        if (useCors) image.crossOrigin = "anonymous";
         let done=false;
         const finish=(fn,value)=>{if(done)return;done=true;clearTimeout(timer);image.onload=null;image.onerror=null;fn(value);};
         const timer=setTimeout(()=>finish(reject,new Error("Kuvan lataus aikakatkaistiin: "+originalUrl)),timeoutMs);
         image.onload=()=>finish(resolve,image);
         image.onerror=()=>finish(reject,new Error("Lataus epäonnistui: "+originalUrl));
-        image.src=safeSrc;
+        image.src=src;
     });
+
+    let img;
+    if (/^https?:\/\//i.test(safeSrc)) {
+        // WEB/localhost: anna selaimen ladata kuva suoraan CORS-kuvana. Tämä välttää
+        // jokaisen korttikuvan blob -> base64 data-URL -muunnoksen ja pienentää
+        // pitkien importtien muistipiikkejä selvästi.
+        try {
+            img = await decodeImage(safeSrc, true);
+        } catch (directError) {
+            console.warn("Suora CORS-kuva epäonnistui; kokeillaan data-URL-varatietä:", directError);
+            const dataSrc = await remoteImageToDataURL(safeSrc, timeoutMs);
+            img = await decodeImage(dataSrc, false);
+        }
+    } else {
+        img = await decodeImage(safeSrc, false);
+    }
+
     decodedImageCache.set(cacheKey,img);
     if (isRemote) trimRemoteArtCaches();
     return img;
