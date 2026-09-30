@@ -8762,9 +8762,9 @@ function maximizeRulesTextCurrentEditor() {
     const fontSlider = document.getElementById("fontSizeSlider");
     const marginSlider = document.getElementById("textWidthSlider");
     const topSlider = document.getElementById("topPaddingSlider");
-    const hyph = document.getElementById("hyphenationToggle");
     if (!fontSlider || !marginSlider || !topSlider) return false;
-    if (hyph) hyph.checked = true;
+    // TAVUTUS on aina käyttäjän oma valinta. MAHDOLLISIMMAN ISO TEKSTI
+    // sovittaa tekstin senhetkisen tavutusasetuksen mukaan eikä muuta checkboxia.
     const maxFont = parseInt(fontSlider.max || "26", 10);
     const minFont = parseInt(fontSlider.min || "-6", 10);
     const startMargin = Math.max(0, parseInt(marginSlider.value || "0", 10));
