@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="fi">
+<!-- WEB VERSION: deploy alongside the existing asset files to an HTTPS host. -->
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -627,7 +628,12 @@ body { padding: 10px; }
 .alter-layer-row.selected .layer-select { outline:2px solid #000080; outline-offset:-2px; font-weight:bold; }
 
 #customBorderColorWrap { margin:6px 0 10px; }
-#borderCustomColor { width:100%; height:32px; padding:0; }
+.cmyk-border-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:5px; margin-top:5px; }
+.cmyk-border-grid label { display:flex; flex-direction:column; gap:2px; font-size:10px; font-weight:bold; }
+.cmyk-border-grid input { width:100%; box-sizing:border-box; min-width:0; padding:4px 3px; font-family:monospace; }
+.border-cmyk-preview-row { display:flex; align-items:center; gap:7px; margin-top:6px; }
+#borderCustomPreview { width:34px; height:22px; border:1px solid #555; background:#ff0000; flex:0 0 auto; }
+#borderCustomColor { display:none; }
 
 .canvas-column {
     width:430px;
@@ -845,6 +851,7 @@ Black Lotus"></textarea>
           <select id="pdfExportMode" style="margin-bottom:6px;">
             <option value="current">EDITORISSA AUKI OLEVA KORTTI</option>
             <option value="all">KAIKKI LISTAN KORTIT / ERILLISET PDF:T</option>
+            <option value="multipage">KOKO KORTTILISTA / YKSI MONISIVUINEN PDF</option>
           </select>
           <button class="menu-button" type="button" onclick="exportPDFByMode()" style="margin-bottom:0;">TALLENNA PDF 300DPI</button>
         </div>
@@ -952,8 +959,16 @@ Black Lotus"></textarea>
           </select>
           <input type="checkbox" id="whiteBordersToggle" style="display:none">
           <div id="customBorderColorWrap" style="display:none;">
-            <label class="control-label" for="borderCustomColor">REUNOJEN VÄRI</label>
-            <input type="color" id="borderCustomColor" value="#ff0000" oninput="generateCard()">
+            <div class="control-label">REUNOJEN VÄRI (CMYK)</div>
+            <div class="cmyk-border-grid">
+              <label>C <input type="number" id="borderCustomC" min="0" max="100" step="1" value="0" inputmode="numeric" oninput="handleBorderCMYKChange()"></label>
+              <label>M <input type="number" id="borderCustomM" min="0" max="100" step="1" value="100" inputmode="numeric" oninput="handleBorderCMYKChange()"></label>
+              <label>Y <input type="number" id="borderCustomY" min="0" max="100" step="1" value="100" inputmode="numeric" oninput="handleBorderCMYKChange()"></label>
+              <label>K <input type="number" id="borderCustomK" min="0" max="100" step="1" value="0" inputmode="numeric" oninput="handleBorderCMYKChange()"></label>
+            </div>
+            <input type="hidden" id="borderCustomColor" value="#ff0000">
+            <div class="border-cmyk-preview-row"><span id="borderCustomPreview"></span><span id="borderCustomCMYKInfo" class="small-note" style="margin:0;">C0 M100 Y100 K0</span></div>
+            <div class="small-note">PDF: reuna tallennetaan CMYK-vektorina. Selaimen esikatselu on CMYK-arvoista tehty RGB-esikatselu.</div>
           </div>
           <div id="whiteBorderControls" style="margin-top:7px;">
             <div class="border-step-row" tabindex="0" data-border-side="left" onclick="selectBorderEdge('left',this)" onkeydown="handleBorderEdgeKeydown(event,'left')"><span>VASEN</span><button type="button" onclick="adjustWhiteBorder('left',-1)">◀</button><span id="whiteBorderLeftValue">71 px</span><button type="button" onclick="adjustWhiteBorder('left',1)">▶</button></div>
@@ -5412,6 +5427,7 @@ function restoreEditorState(state) {
         if (mode) mode.value = "small";
     }
     updateRulesManaSymbolControls();
+    restoreBorderCMYKCompatibility(state);
     syncModernControlProxies();
 }
 
@@ -7222,7 +7238,16 @@ async function loadDeckList() {
     const failures=[];
     const loadErrors=[];
 
-    suppressDeckSync=true; currentDeckEntryId=null; selectedDeckEntryId=null; deckEntries=[]; designCounter=1; entryCounter=1;
+    // Uusi korttilista LISÄTÄÄN aina nykyisen listan perään. Älä tyhjennä
+    // olemassa olevia kortteja, niiden designeja, lukituksia tai järjestystä.
+    if (currentDeckEntryId !== null) syncCurrentDeckDesignFromCanvas();
+    suppressDeckSync=true; currentDeckEntryId=null; selectedDeckEntryId=null;
+    if (deckEntries.length) {
+        const maxEntryId = Math.max(0, ...deckEntries.map(e => Number(e?.id) || 0));
+        const maxDesignId = Math.max(0, ...deckEntries.map(e => Number(e?.design?.id) || 0));
+        entryCounter = Math.max(Number(entryCounter) || 1, maxEntryId + 1);
+        designCounter = Math.max(Number(designCounter) || 1, maxDesignId + 1);
+    }
     window.deckMultiSelectMode=false; window.deckMultiSelectedIds?.clear?.();
     window.deckLockMode=false;
     const editorView=document.getElementById("editorView"); if(editorView) editorView.style.display="none";
@@ -7317,21 +7342,39 @@ async function loadDeckList() {
 }
 
 async function renderDeckEntryToPngData(entry,width=744,height=1039) {
+    // Jokaiselle sivulle puhdas bitmap. Aikaisemman kortin origin-historiaa ei
+    // voi korjata clearRectilla, mutta canvasin koon resetointi poistaa sen.
+    if (location.protocol === "file:") throw new Error("Käynnistä LOCALHOST-versio .command-tiedostolla: PDF-vienti ei toimi luotettavasti file://-osoitteesta.");
     restoreEditorState(entry.design.state);
-    await generateCard();
-    const temp=document.createElement("canvas"); temp.width=width; temp.height=height;
-    const tc=temp.getContext("2d"); tc.imageSmoothingEnabled=true; tc.imageSmoothingQuality="high";
-    tc.drawImage(canvas,0,0,width,height);
-    return temp.toDataURL("image/png");
+    resetMainCanvasForCleanExport();
+    pdfImageLoadFailure = null;
+    const oldStrict = window.__mtgPdfStrictImages;
+    window.__mtgPdfStrictImages = true;
+    try {
+        await generateCard();
+        if (pdfImageLoadFailure) throw pdfImageLoadFailure;
+        const temp=document.createElement("canvas"); temp.width=width; temp.height=height;
+        const tc=temp.getContext("2d"); tc.imageSmoothingEnabled=true; tc.imageSmoothingQuality="high";
+        tc.drawImage(canvas,0,0,width,height);
+        return temp.toDataURL("image/png");
+    } catch (e) {
+        throw new Error("Kortti '" + (entry?.name || "?") + "': " + (e?.message || e));
+    } finally {
+        window.__mtgPdfStrictImages = oldStrict;
+    }
 }
 
 function safePdfBaseName(name) {
     return String(name||"card").trim().toLowerCase().replace(/[^a-z0-9äöå_-]+/gi,"_").replace(/^_+|_+$/g,"") || "card";
 }
 
-function buildPrintPdfFromImageData(imgData) {
+function buildPrintPdfFromImageData(imgData, existingDoc=null) {
+    // Käytössä SEKÄ yhden kortin että monisivuisen PDF:n exportissa.
+    // Kaikki sivut piirtyvät täsmälleen samalla bleed-, kuva-, CMYK- ja
+    // leikkausmerkkikoodilla. Yksittäisen kortin toiminta säilyy ennallaan.
     const {jsPDF}=window.jspdf;
-    const doc=new jsPDF({orientation:'portrait',unit:'mm',format:[95,120],compress:false});
+    const doc=existingDoc || new jsPDF({orientation:'portrait',unit:'mm',format:[95,120],compress:false});
+    if (existingDoc) doc.addPage([95,120], 'portrait');
     const trimW=63.5, trimH=88.9, bleed=3;
     const bleedW=trimW+2*bleed, bleedH=trimH+2*bleed;
     const pageW=doc.internal.pageSize.getWidth(), pageH=doc.internal.pageSize.getHeight();
@@ -7339,6 +7382,7 @@ function buildPrintPdfFromImageData(imgData) {
     const trimX=bleedX+bleed, trimY=bleedY+bleed;
     doc.setFillColor(0,0,0); doc.rect(bleedX,bleedY,bleedW,bleedH,'F');
     doc.addImage(imgData,'PNG',trimX,trimY,trimW,trimH);
+    addPdfBorderOverlayIfNeeded(doc, trimX, trimY, trimW, trimH);
     doc.setDrawColor(0,0,0,1.0); doc.setLineWidth(0.25);
     const markLength=5, markOffset=3;
     const line=(x1,y1,x2,y2)=>doc.line(x1,y1,x2,y2);
@@ -7354,6 +7398,10 @@ async function exportPDFByMode() {
     if(mode==="current") {
         if (currentDeckEntryId === null && deckEntries.length) { alert("Avaa ensin haluamasi kortti editoriin tuplaklikkaamalla thumbnailia."); return; }
         await downloadPDF(); return;
+    }
+    if (mode==="multipage") {
+        await window.downloadWholeDeckOnePDF();
+        return;
     }
     await downloadAllDeckPDFs();
 }
@@ -7418,6 +7466,7 @@ async function downloadA4PDF() {
                 setDeckStatus(`A4 PDF: kortti ${page*9+i+1}/${entries.length}`);
                 const img=await renderDeckEntryToPngData(cards[i],744,1039);
                 doc.addImage(img,"PNG",x,y,trimW,trimH);
+                addPdfBorderOverlayIfNeeded(doc, x, y, trimW, trimH);
             }
             doc.setDrawColor(0,0,0); doc.setLineWidth(0.2); const off=3,len=6;
             for(let c=0;c<=3;c++){const x=startX+c*trimW;doc.line(x,startY-off,x,startY-off-len);doc.line(x,startY+3*trimH+off,x,startY+3*trimH+off+len);}
@@ -7472,6 +7521,124 @@ function setFlavorGapMode(value) {
     generateCard();
 }
 
+function clampCMYKPercent(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function getBorderCustomCMYK() {
+    const read = id => clampCMYKPercent(document.getElementById(id)?.value ?? 0);
+    return {
+        c: read("borderCustomC"),
+        m: read("borderCustomM"),
+        y: read("borderCustomY"),
+        k: read("borderCustomK")
+    };
+}
+
+function cmykToRgb(c, m, y, k) {
+    c = clampCMYKPercent(c) / 100;
+    m = clampCMYKPercent(m) / 100;
+    y = clampCMYKPercent(y) / 100;
+    k = clampCMYKPercent(k) / 100;
+    return {
+        r: Math.round(255 * (1 - c) * (1 - k)),
+        g: Math.round(255 * (1 - m) * (1 - k)),
+        b: Math.round(255 * (1 - y) * (1 - k))
+    };
+}
+
+function rgbHexToCmyk(hex) {
+    const m = String(hex || "").trim().match(/^#?([0-9a-f]{6})$/i);
+    if (!m) return { c:0, m:100, y:100, k:0 };
+    const n = parseInt(m[1], 16);
+    const r = ((n >> 16) & 255) / 255;
+    const g = ((n >> 8) & 255) / 255;
+    const b = (n & 255) / 255;
+    const k = 1 - Math.max(r, g, b);
+    if (k >= 0.999999) return { c:0, m:0, y:0, k:100 };
+    return {
+        c: Math.round(100 * ((1 - r - k) / (1 - k))),
+        m: Math.round(100 * ((1 - g - k) / (1 - k))),
+        y: Math.round(100 * ((1 - b - k) / (1 - k))),
+        k: Math.round(100 * k)
+    };
+}
+
+function borderCMYKToCss(cmyk = getBorderCustomCMYK()) {
+    const rgb = cmykToRgb(cmyk.c, cmyk.m, cmyk.y, cmyk.k);
+    const hex = n => Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0");
+    return `#${hex(rgb.r)}${hex(rgb.g)}${hex(rgb.b)}`;
+}
+
+function updateBorderCMYKPreview() {
+    const cmyk = getBorderCustomCMYK();
+    const css = borderCMYKToCss(cmyk);
+    const hidden = document.getElementById("borderCustomColor");
+    const preview = document.getElementById("borderCustomPreview");
+    const info = document.getElementById("borderCustomCMYKInfo");
+    if (hidden) hidden.value = css;
+    if (preview) preview.style.background = css;
+    if (info) info.textContent = `C${cmyk.c} M${cmyk.m} Y${cmyk.y} K${cmyk.k}`;
+    return css;
+}
+
+function handleBorderCMYKChange() {
+    for (const id of ["borderCustomC", "borderCustomM", "borderCustomY", "borderCustomK"]) {
+        const el = document.getElementById(id);
+        if (el) el.value = String(clampCMYKPercent(el.value));
+    }
+    updateBorderCMYKPreview();
+    generateCard();
+}
+
+function restoreBorderCMYKCompatibility(state) {
+    // Uudet projektit sisältävät CMYK-kentät suoraan. Vanhoissa projekteissa
+    // oli vain HTML/RGB-värikenttä; muunnetaan se kerran lähimmäksi CMYK-arvoksi.
+    const hasCMYK = ["borderCustomC", "borderCustomM", "borderCustomY", "borderCustomK"]
+        .every(id => state?.fields?.[id]);
+    if (!hasCMYK) {
+        const legacy = state?.fields?.borderCustomColor?.value || document.getElementById("borderCustomColor")?.value || "#ff0000";
+        const cmyk = rgbHexToCmyk(legacy);
+        for (const [id, value] of [["borderCustomC",cmyk.c],["borderCustomM",cmyk.m],["borderCustomY",cmyk.y],["borderCustomK",cmyk.k]]) {
+            const el = document.getElementById(id);
+            if (el) el.value = String(value);
+        }
+    }
+    updateBorderCMYKPreview();
+}
+
+function getCurrentBorderCMYKForPdf() {
+    const mode = document.getElementById("borderModeSelect")?.value || "none";
+    if (mode === "none") return null;
+    if (mode === "white") return { c:0, m:0, y:0, k:0 };
+    if (mode === "black") return { c:0, m:0, y:0, k:100 };
+    if (mode === "custom") return getBorderCustomCMYK();
+    return null;
+}
+
+function setJsPdfFillCMYK(doc, cmyk) {
+    const f = n => (clampCMYKPercent(n) / 100).toFixed(4);
+    // jsPDF tulkitsee neljä fill-parametria CMYK:ksi.
+    doc.setFillColor(f(cmyk.c), f(cmyk.m), f(cmyk.y), f(cmyk.k));
+}
+
+function addPdfBorderOverlayIfNeeded(doc, x, y, widthMm, heightMm) {
+    const cmyk = getCurrentBorderCMYKForPdf();
+    if (!cmyk) return;
+    const read = id => Math.max(0, Math.min(300, parseInt(document.getElementById(id)?.value || "0", 10)));
+    const left = widthMm * read("whiteBorderLeft") / 1488;
+    const right = widthMm * read("whiteBorderRight") / 1488;
+    const top = heightMm * read("whiteBorderTop") / 2079;
+    const bottom = heightMm * read("whiteBorderBottom") / 2079;
+    setJsPdfFillCMYK(doc, cmyk);
+    if (left > 0) doc.rect(x, y, left, heightMm, "F");
+    if (right > 0) doc.rect(x + widthMm - right, y, right, heightMm, "F");
+    if (top > 0) doc.rect(x, y, widthMm, top, "F");
+    if (bottom > 0) doc.rect(x, y + heightMm - bottom, widthMm, bottom, "F");
+}
+
 function syncModernControlProxies() {
     const gap = document.getElementById("flavorGapMode");
     const small = !!document.getElementById("flavorGapToggle")?.checked;
@@ -7483,6 +7650,7 @@ function syncModernControlProxies() {
     if (mode && legacy) legacy.checked = mode.value !== "none";
     const customWrap = document.getElementById("customBorderColorWrap");
     if (customWrap) customWrap.style.display = mode?.value === "custom" ? "block" : "none";
+    updateBorderCMYKPreview();
 }
 
 async function handleBorderModeChange() {
@@ -7497,7 +7665,7 @@ function drawWhiteBorderStrips(targetCtx) {
     const left = read("whiteBorderLeft"), right = read("whiteBorderRight"), top = read("whiteBorderTop"), bottom = read("whiteBorderBottom");
     let color = "#ffffff";
     if (mode === "black") color = "#000000";
-    if (mode === "custom") color = document.getElementById("borderCustomColor")?.value || "#ff0000";
+    if (mode === "custom") color = updateBorderCMYKPreview();
     targetCtx.save();
     targetCtx.globalAlpha = 1;
     targetCtx.globalCompositeOperation = "source-over";
@@ -7592,22 +7760,48 @@ async function remoteImageToDataURL(url, timeoutMs = 15000) {
     } finally { clearTimeout(timer); }
 }
 
+// PDF-vienti varmistaa jokaisen lähdekuvan origin-clean-tilan ennen
+// piirtämistä. Tavallinen thumbnail-/editorikäyttö säilyttää nopean latauspolun.
+let pdfImageLoadFailure = null;
+const pdfLocalImageDataCache = new Map();
+
+function checkImageIsExportable(img, name) {
+    const test = document.createElement("canvas");
+    test.width = 2; test.height = 2;
+    const c = test.getContext("2d", {willReadFrequently:true});
+    c.drawImage(img, 0, 0, 2, 2);
+    try { c.getImageData(0, 0, 1, 1); }
+    catch (e) {
+        throw new Error("Kuvan käyttö PDF:ssä on estetty (CORS/origin-clean): " + name + ". " + (e?.message || e));
+    }
+}
+
+async function pdfSafeLocalURLToDataURL(url, timeoutMs=15000) {
+    const absolute = new URL(url, document.baseURI);
+    if (absolute.protocol !== "http:" && absolute.protocol !== "https:") {
+        throw new Error("Paikallisia kuvien lähdetiedostoja ei voi lukea file://-osoitteesta. Käynnistä LOCALHOST .command-tiedostolla. Osoite: " + absolute.href);
+    }
+    const key = absolute.href;
+    if (pdfLocalImageDataCache.has(key)) return pdfLocalImageDataCache.get(key);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await browserFetch(key, {method:"GET",mode:"cors",credentials:"omit",signal:controller.signal});
+        if (!response.ok) throw new Error("Kuvan HTTP " + response.status + ": " + key);
+        const data = await blobToDataURL(await response.blob());
+        // Välimuistissa säilytetään vain paikallisia resursseja, ei koko dekin taidekuvia.
+        if (pdfLocalImageDataCache.size >= 24) pdfLocalImageDataCache.delete(pdfLocalImageDataCache.keys().next().value);
+        pdfLocalImageDataCache.set(key, data);
+        return data;
+    } finally { clearTimeout(timer); }
+}
+
 async function loadImage(url, timeoutMs = 15000) {
     const originalUrl = String(url || "");
     if (!originalUrl) throw new Error("Kuvan osoite puuttuu");
-    const isRemote = /^https?:\/\//i.test(originalUrl);
+    const isRemote = /^https?:\/\//i.test(originalUrl) || /^\/\//.test(originalUrl);
     let safeSrc = resolveEmbeddedLocalImageSource(originalUrl);
-    if (exportSafeLocalAssetMode && location.protocol === "file:" &&
-        !/^(?:data:|blob:|https?:\/\/|file:)/i.test(safeSrc)) {
-        safeSrc = await localAssetToDataURL(safeSrc);
-    }
-
-    const cacheKey = (isRemote ? "REMOTE|" : (exportSafeLocalAssetMode ? "LOCALSAFE|" : "LOCAL|")) + originalUrl;
-    if (decodedImageCache.has(cacheKey)) {
-        const cached = decodedImageCache.get(cacheKey);
-        if (isRemote) { decodedImageCache.delete(cacheKey); decodedImageCache.set(cacheKey, cached); }
-        return cached;
-    }
+    const exportMode = window.__mtgPdfStrictImages === true;
 
     const decodeImage = (src, useCors) => new Promise((resolve,reject) => {
         const image = new Image();
@@ -7620,25 +7814,68 @@ async function loadImage(url, timeoutMs = 15000) {
         image.src=src;
     });
 
-    let img;
-    if (/^https?:\/\//i.test(safeSrc)) {
-        // WEB/localhost: anna selaimen ladata kuva suoraan CORS-kuvana. Tämä välttää
-        // jokaisen korttikuvan blob -> base64 data-URL -muunnoksen ja pienentää
-        // pitkien importtien muistipiikkejä selvästi.
-        try {
-            img = await decodeImage(safeSrc, true);
-        } catch (directError) {
-            console.warn("Suora CORS-kuva epäonnistui; kokeillaan data-URL-varatietä:", directError);
-            const dataSrc = await remoteImageToDataURL(safeSrc, timeoutMs);
-            img = await decodeImage(dataSrc, false);
+    try {
+        if (exportMode && location.protocol === "file:") {
+            throw new Error("PDF-vienti vaatii LOCALHOST-käynnistyksen. Avaa ohjelma mukana tulevalla .command-tiedostolla (osoite alkaa http://127.0.0.1:8765/), älä avaa HTML:ää suoraan file://-osoitteesta.");
         }
-    } else {
-        img = await decodeImage(safeSrc, false);
-    }
+        // Tiedoston oman lataustavan muutokset eivät saa vaikuttaa thumbnailien
+        // muistinhallintaan. PDF-tila käyttää eri välimuistiavaimia.
+        const cacheKey = (exportMode ? (isRemote ? "REMOTE|PDFSAFE|" : "PDFSAFE|") : isRemote ? "REMOTE|" : "LOCAL|") + originalUrl;
+        if (decodedImageCache.has(cacheKey)) {
+            const cached = decodedImageCache.get(cacheKey);
+            if (isRemote) { decodedImageCache.delete(cacheKey); decodedImageCache.set(cacheKey, cached); }
+            if (exportMode) checkImageIsExportable(cached, originalUrl);
+            return cached;
+        }
 
-    decodedImageCache.set(cacheKey,img);
-    if (isRemote) trimRemoteArtCaches();
-    return img;
+        if (exportSafeLocalAssetMode && location.protocol === "file:" &&
+            !/^(?:data:|blob:|https?:\/\/|file:)/i.test(safeSrc)) {
+            safeSrc = await localAssetToDataURL(safeSrc);
+        }
+        let img;
+        if (exportMode) {
+            // Kaikki ulkoiset kuvat luetaan CORS-fetchillä blobiksi ja sitten
+            // data-URL:ksi. Näin missään vaiheessa PDF:ään ei piirretä kuvaa,
+            // jonka origin-clean-tilaa ei voi todentaa.
+            if (/^https?:\/\//i.test(safeSrc) || /^\/\//.test(safeSrc)) {
+                const absolute = new URL(safeSrc, document.baseURI);
+                try {
+                    if (absolute.origin === location.origin) safeSrc = await pdfSafeLocalURLToDataURL(absolute.href, timeoutMs);
+                    else safeSrc = await remoteImageToDataURL(absolute.href, timeoutMs);
+                    img = await decodeImage(safeSrc, false);
+                } catch (fetchError) {
+                    // Jos palvelin sallii vain <img crossorigin>-latauksen,
+                    // sitä saa käyttää, mutta vain läpäistyään origin-clean-testin.
+                    img = await decodeImage(absolute.href, true);
+                    checkImageIsExportable(img, originalUrl);
+                }
+            } else if (/^(?:data:|blob:)/i.test(safeSrc)) {
+                img = await decodeImage(safeSrc, false);
+            } else {
+                safeSrc = await pdfSafeLocalURLToDataURL(safeSrc, timeoutMs);
+                img = await decodeImage(safeSrc, false);
+            }
+            checkImageIsExportable(img, originalUrl);
+        } else if (/^https?:\/\//i.test(safeSrc) || /^\/\//.test(safeSrc)) {
+            try { img = await decodeImage(safeSrc, true); }
+            catch (directError) {
+                console.warn("Suora CORS-kuva epäonnistui; kokeillaan data-URL-varatietä:", directError);
+                const dataSrc = await remoteImageToDataURL(safeSrc, timeoutMs);
+                img = await decodeImage(dataSrc, false);
+            }
+        } else {
+            img = await decodeImage(safeSrc, false);
+        }
+
+        decodedImageCache.set(cacheKey,img);
+        if (isRemote) trimRemoteArtCaches();
+        return img;
+    } catch (e) {
+        if (exportMode && !pdfImageLoadFailure) {
+            pdfImageLoadFailure = new Error("PDF-kuvan lataus epäonnistui: " + originalUrl + " (" + (e?.message || e) + ")");
+        }
+        throw e;
+    }
 }
 
 async function setDeckThumbnailQuality(value) {
@@ -8109,7 +8346,7 @@ const ALL_CARDS_STYLE_FIELD_IDS = [
     "hyphenationToggle", "centerShortTextToggle", "maximizeRulesTextToggle",
     "flavorGapMode", "flavorGapToggle", "largeFlavorGapToggle",
     "hideFlavorToggle", "hideAllTextToggle", "shrinkSymbolsToggle", "rulesManaSymbolSizeMode", "rulesManaSymbolCustomSize", "rulesManaSymbolOffsetX", "rulesManaSymbolOffsetY", "tombstoneToggle",
-    "borderModeSelect", "borderCustomColor", "whiteBordersToggle",
+    "borderModeSelect", "borderCustomColor", "borderCustomC", "borderCustomM", "borderCustomY", "borderCustomK", "whiteBordersToggle",
     "whiteBorderLeft", "whiteBorderRight", "whiteBorderTop", "whiteBorderBottom",
     "imageAdjustmentTarget", "contrastSlider", "saturationSlider", "hueSlider", "brightnessSlider",
     "landFrameSlider", "symbolSizeSlider", "symbolAlignSlider", "symbolAlignSliderY"
@@ -8417,6 +8654,7 @@ const UI_TEXT_MAP = {
     "TALLENNA PNG": ["TALLENNA PNG", "SAVE PNG"], "TALLENNA PDF 300DPI": ["TALLENNA PDF 300DPI", "SAVE PDF 300DPI"],
     "EDITORISSA AUKI OLEVA KORTTI": ["EDITORISSA AUKI OLEVA KORTTI", "CARD OPEN IN EDITOR"],
     "KAIKKI LISTAN KORTIT / ERILLISET PDF:T": ["KAIKKI LISTAN KORTIT / ERILLISET PDF:T", "ALL CARDS / SEPARATE PDF FILES"],
+    "KOKO KORTTILISTA / YKSI MONISIVUINEN PDF": ["KOKO KORTTILISTA / YKSI MONISIVUINEN PDF", "FULL DECK / ONE MULTIPAGE PDF"],
     "TALLENNA A4 ARKKI": ["TALLENNA A4 ARKKI", "SAVE A4 SHEET"],
     "TEKSTI": ["TEKSTI", "TEXT"], "SÄÄNTÖTEKSTI / KORTIN TIEDOT": ["SÄÄNTÖTEKSTI / KORTIN TIEDOT", "RULES TEXT / CARD DATA"],
     "FLAVOR": ["FLAVOR-TEKSTI", "FLAVOR"], "MODERNI / VANHA": ["MODERNI / VANHA", "MODERN / OLD"], "MODERNI": ["MODERNI", "MODERN"], "VANHA": ["VANHA", "OLD"],
@@ -8438,7 +8676,9 @@ const UI_TEXT_MAP = {
     "FLASHBACK-HAUTAKIVI": ["FLASHBACK-HAUTAKIVI", "FLASHBACK TOMBSTONE"], "TYHJENNÄ TEKSTI": ["TYHJENNÄ TEKSTI", "CLEAR TEXT"], "TYHJENNÄ FLAVOR": ["TYHJENNÄ FLAVOR", "CLEAR FLAVOR"],
     "SUOMENNOS OFF": ["SUOMENNOS POIS", "FINNISH TRANSLATION OFF"],
     "KUVA": ["KUVA", "IMAGE"], "REUNAT": ["REUNAT", "BORDERS"], "EI": ["EI", "NONE"], "VALKOINEN": ["VALKOINEN", "WHITE"], "MUSTA": ["MUSTA", "BLACK"], "MUU / VÄRIVALINTA": ["MUU / VÄRIVALINTA", "CUSTOM COLOR"],
-    "REUNOJEN VÄRI": ["REUNOJEN VÄRI", "BORDER COLOR"], "VASEN": ["VASEN", "LEFT"], "OIKEA": ["OIKEA", "RIGHT"], "YLÄ": ["YLÄ", "TOP"], "ALA": ["ALA", "BOTTOM"],
+    "REUNOJEN VÄRI": ["REUNOJEN VÄRI", "BORDER COLOR"], "REUNOJEN VÄRI (CMYK)": ["REUNOJEN VÄRI (CMYK)", "BORDER COLOR (CMYK)"],
+    "PDF: reuna tallennetaan CMYK-vektorina. Selaimen esikatselu on CMYK-arvoista tehty RGB-esikatselu.": ["PDF: reuna tallennetaan CMYK-vektorina. Selaimen esikatselu on CMYK-arvoista tehty RGB-esikatselu.", "PDF: the border is saved as CMYK vector color. Browser preview is an RGB preview converted from the CMYK values."],
+    "VASEN": ["VASEN", "LEFT"], "OIKEA": ["OIKEA", "RIGHT"], "YLÄ": ["YLÄ", "TOP"], "ALA": ["ALA", "BOTTOM"],
     "Klikkaa haluamaasi reunaa. Sen jälkeen voit siirtää sitä myös näppäimistön nuolinäppäimillä.": ["Klikkaa haluamaasi reunaa. Sen jälkeen voit siirtää sitä myös näppäimistön nuolinäppäimillä.", "Click the border you want to adjust. You can then move it with the keyboard arrow keys."],
     "KORTIN KUVA / PAINOS": ["KORTIN KUVA / PAINOS", "CARD ART / PRINTING"], "Hae kortti ensin": ["Hae kortti ensin", "Search for a card first"],
     "Vanhin paperipainos valitaan automaattisesti.": ["Vanhin paperipainos valitaan automaattisesti.", "The oldest paper printing is selected automatically."],
@@ -9963,12 +10203,17 @@ function keepDoubleFacedPairsSideBySide() {
     }
 
     async function prepareCurrentCanvasForExport() {
-        // Poista mahdollinen aikaisempi taint-history bitmapin resetillä. Tämä ei avaa
-        // mitään asset-/upload-dialogia; kortti piirretään normaalisti uudelleen.
+        // Sama tarkistettu kuvien latauspolku yksittäiselle ja monisivuiselle PDF:lle.
+        if (location.protocol === "file:") throw new Error("Avaa LOCALHOST-versio .command-käynnistimellä, ei suoraan file://-osoitteesta.");
         exportSafeLocalAssetMode = false;
-        decodedImageCache.clear();
         resetMainCanvasForCleanExport();
-        await generateCard();
+        pdfImageLoadFailure = null;
+        const oldStrict = window.__mtgPdfStrictImages;
+        window.__mtgPdfStrictImages = true;
+        try {
+            await generateCard();
+            if (pdfImageLoadFailure) throw pdfImageLoadFailure;
+        } finally { window.__mtgPdfStrictImages = oldStrict; }
     }
 
     window.downloadPNG = async function downloadPNG() {
@@ -10011,6 +10256,71 @@ function keepDoubleFacedPairsSideBySide() {
         }
     };
 
+    // YKSI monisivuinen paino-PDF, yksi kortti/sivu. Toteutuksessa käytetään
+    // samaa buildPrintPdfFromImageData()-rutiinia kuin yhden kortin PDF:ssä,
+    // eikä kuvia viedä JPEG:nä tai piirretä eri skaalalla.
+    window.downloadWholeDeckOnePDF = async function downloadWholeDeckOnePDF() {
+        const {jsPDF} = window.jspdf || {};
+        if (!jsPDF) { alert("jsPDF-kirjastoa ei löytynyt!"); return; }
+        if (deckLoadRunning || window.deckInteractionLoadingLock) {
+            alert(uiText("Odota, että korttilista on latautunut kokonaan.", "Wait for the decklist to finish loading."));
+            return;
+        }
+        if (!deckEntries.length) {
+            alert(uiText("Korttilista on tyhjä.", "The decklist is empty."));
+            return;
+        }
+
+        // Tallenna avoinna olevan kortin tuoreimmat muutokset ennen renderöintiä.
+        if (currentDeckEntryId !== null) syncCurrentDeckDesignFromCanvas();
+        const entries = deckEntriesInVisibleOrder();
+        const env = makeDeckRenderEnvironment();
+        const priorSuppress = suppressDeckSync;
+        const exportButton = document.querySelector('button[onclick="exportPDFByMode()"]');
+        if (exportButton?.disabled) return;
+        if (exportButton) exportButton.disabled = true;
+        suppressDeckSync = true;
+        try {
+            exportSafeLocalAssetMode = false;
+            decodedImageCache.clear();
+            let doc = null;
+            for (let i = 0; i < entries.length; i++) {
+                setDeckStatus(uiText(
+                    `Monisivuinen PDF: kortti ${i+1}/${entries.length} – ${entries[i].name}`,
+                    `Multipage PDF: card ${i+1}/${entries.length} – ${entries[i].name}`
+                ));
+                // Sama puhdas pääcanvas kuin yksittäisen kortin PDF-exportissa.
+                resetMainCanvasForCleanExport();
+                const imgData = await renderDeckEntryToPngData(entries[i], 744, 1039);
+                doc = buildPrintPdfFromImageData(imgData, doc);
+                // Yllä piirretään myös kunkin kortin CMYK-reunat sen omista arvoista.
+                if ((i+1) % 3 === 0) await new Promise(r => setTimeout(r, 0));
+            }
+            const blob = doc.output("blob");
+            const saved = await saveBlobWithNativeDialog(
+                blob, "koko_korttilista_300dpi_print.pdf", "PDF document", "application/pdf", [".pdf"]
+            );
+            if (saved) setDeckStatus(uiText(
+                `Monisivuinen PDF tallennettu: ${entries.length} korttia / ${entries.length} sivua.`,
+                `Multipage PDF saved: ${entries.length} cards / ${entries.length} pages.`
+            ));
+        } catch (e) {
+            console.error("Monisivuisen PDF:n luominen epäonnistui:", e);
+            const taint = e && (e.name === "SecurityError" || /taint|cross-origin|origin-clean/i.test(String(e.message || e)));
+            alert(taint
+                ? uiText("PDF-vienti estyi kuvan käyttöoikeuksien takia. Kortti/kuva: ", "PDF export was blocked by image origin permissions. Card/image: ") + (e?.message || e)
+                : uiText("Monisivuisen PDF:n luominen epäonnistui: ", "Multipage PDF export failed: ") + (e?.message || e)
+            );
+        } finally {
+            // Palauta editori ja korttilistan näkymä; muita exportteja ei muuteta.
+            try { await restoreDeckRenderEnvironment(env); }
+            finally {
+                suppressDeckSync = priorSuppress;
+                if (exportButton) exportButton.disabled = false;
+            }
+        }
+    };
+
     function addA4CropMarks(doc, startX, startY, trimW, trimH) {
         doc.setDrawColor(0,0,0);
         doc.setLineWidth(0.2);
@@ -10039,6 +10349,7 @@ function keepDoubleFacedPairsSideBySide() {
             setDeckStatus(`A4 PDF: kortti ${absoluteStartIndex+i+1}/${totalCount}`);
             const img = await renderDeckEntryToPngData(cards[i], 744, 1039);
             doc.addImage(img, "PNG", x, y, trimW, trimH);
+            addPdfBorderOverlayIfNeeded(doc, x, y, trimW, trimH);
         }
         addA4CropMarks(doc, startX, startY, trimW, trimH);
     }
@@ -10119,6 +10430,8 @@ function keepDoubleFacedPairsSideBySide() {
 // - Yksi eksplisiittinen kopiointinappi.
 // - ALTER on poistettu käyttöliittymästä ja renderöinnistä.
 // - Thumbnailista säilytetään vain JPEG, ei rinnakkaista canvas-kopiota.
+// - Uudet korttilistat lisätään nykyisen listan perään.
+// - Reunan oma väri syötetään CMYK-arvoina; PDF-reuna piirretään CMYK-vektorina.
 // =============================================================
 window.editAllCardsMode = false;
 
@@ -10132,26 +10445,40 @@ installAlterInteractions = function() {};
 installStickerPasteShortcut = function() {};
 drawAlterLayer = async function() {};
 
-// Localhost/HTTPS: JPEG-thumbnail riittää. Ei pidetä joka kortista myös raakaa
-// canvas-bitmapia muistissa.
+// Tallenna yleensä vain kevyt JPEG-thumbnail. Jos jokin aiemmin piirretty
+// kuva on merkinnyt canvasin origin-epäpuhtaaksi, toDataURL heittää
+// SecurityErrorin. Silloin pieni canvas voidaan silti piirtää näkyviin
+// thumbnail-listaan (ilman että tallennetaan täysikokoista canvasia).
+// Fallback-canvas säilytetään VAIN, kun JPEG:n luonti epäonnistuu.
 captureCanvasAssets = function() {
     let thumb = null;
+    let thumbCanvas = null;
     let exportError = null;
     try {
         const q = getDeckThumbnailQualityConfig();
-        const thumbCanvas = document.createElement("canvas");
+        thumbCanvas = document.createElement("canvas");
         thumbCanvas.width = q.width;
         thumbCanvas.height = q.height;
         const thumbCtx = thumbCanvas.getContext("2d");
+        if (!thumbCtx) throw new Error("Thumbnail-canvasin piirtoalusta puuttuu.");
         thumbCtx.imageSmoothingEnabled = true;
         thumbCtx.imageSmoothingQuality = "high";
         thumbCtx.drawImage(canvas, 0, 0, q.width, q.height);
-        thumb = thumbCanvas.toDataURL("image/jpeg", q.jpeg);
+        try {
+            const jpeg = thumbCanvas.toDataURL("image/jpeg", q.jpeg);
+            if (!jpeg || jpeg === "data:,") throw new Error("Thumbnail-JPEG jäi tyhjäksi.");
+            thumb = jpeg;
+            thumbCanvas = null; // muistisäästö: onnistuneelle JPEGille ei säilytetä canvasia
+        } catch (e) {
+            exportError = e;
+            console.warn("Thumbnail-JPEG estyi; käytetään canvas-esikatselua:", e);
+        }
     } catch (e) {
         exportError = e;
-        console.warn("Thumbnailin luonti epäonnistui:", e);
+        thumbCanvas = null;
+        console.warn("Thumbnailin piirtäminen epäonnistui:", e);
     }
-    return { printImg: null, thumb, thumbCanvas: null, snapshotCanvas: null, exportError };
+    return { printImg: null, thumb, thumbCanvas, snapshotCanvas: null, exportError };
 };
 
 updateAllCardsModeUI = function() {
