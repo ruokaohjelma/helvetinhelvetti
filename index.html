@@ -857,6 +857,7 @@ Black Lotus"></textarea>
         </div>
 
         <button class="menu-button" type="button" onclick="downloadA4PDF()">TALLENNA A4 ARKKI</button>
+        <div class="small-note">A4-tulostus: yksi PDF, 9 korttia / sivu. Tulosta koossa 100 % / Actual size (ei sovitusta sivulle).</div>
       </div>
     </details>
 
@@ -7406,19 +7407,65 @@ async function exportPDFByMode() {
     await downloadAllDeckPDFs();
 }
 
+// Valmistaa yhden ZIP-latauksen ilman selaimen kansiovalitsinta tai lisäkirjastoja.
+// Jokainen paketin tiedosto on edelleen itsenäinen, alkuperäisillä PDF-asetuksilla tehty PDF.
+async function makeStoredZipArchive(files) {
+    if (!files.length) throw new Error("ZIP-arkistossa ei ole tiedostoja.");
+    if (files.length > 65535) throw new Error("ZIP-tiedostoja on liian monta.");
+    const enc = new TextEncoder();
+    const table = new Uint32Array(256);
+    for(let i=0;i<256;i++) {
+        let c=i;
+        for(let j=0;j<8;j++) c=(c&1) ? (0xEDB88320^(c>>>1)) : (c>>>1);
+        table[i]=c>>>0;
+    }
+    const parts=[];
+    const directory=[];
+    let offset=0;
+    const put16=(dv,p,v)=>dv.setUint16(p,v,true);
+    const put32=(dv,p,v)=>dv.setUint32(p,v>>>0,true);
+    for(const item of files) {
+        const name=enc.encode(String(item.filename));
+        const bytes=new Uint8Array(await item.blob.arrayBuffer());
+        if(name.length>65535 || bytes.length>0xFFFFFFFF) throw new Error("Liian suuri tiedosto ZIP-pakkaukseen.");
+        let crc=0xFFFFFFFF;
+        for(let i=0;i<bytes.length;i++) crc=table[(crc^bytes[i])&255]^(crc>>>8);
+        crc=(crc^0xFFFFFFFF)>>>0;
+        const local=new Uint8Array(30+name.length), l=new DataView(local.buffer);
+        put32(l,0,0x04034b50); put16(l,4,20); put16(l,6,0x0800); // UTF-8
+        put16(l,8,0); put16(l,10,0); put16(l,12,0);
+        put32(l,14,crc); put32(l,18,bytes.length); put32(l,22,bytes.length);
+        put16(l,26,name.length); put16(l,28,0); local.set(name,30);
+        parts.push(local,item.blob);
+        const cent=new Uint8Array(46+name.length), c=new DataView(cent.buffer);
+        put32(c,0,0x02014b50); put16(c,4,20); put16(c,6,20);
+        put16(c,8,0x0800); put16(c,10,0); put16(c,12,0); put16(c,14,0);
+        put32(c,16,crc); put32(c,20,bytes.length); put32(c,24,bytes.length);
+        put16(c,28,name.length); put16(c,30,0); put16(c,32,0);
+        put16(c,34,0); put16(c,36,0); put32(c,38,0); put32(c,42,offset);
+        cent.set(name,46); directory.push(cent);
+        offset+=local.length+bytes.length;
+        if(offset>0xFFFFFFFF) throw new Error("ZIP-arkisto on liian suuri.");
+    }
+    const directorySize=directory.reduce((n,v)=>n+v.length,0);
+    const end=new Uint8Array(22), e=new DataView(end.buffer);
+    put32(e,0,0x06054b50); put16(e,4,0); put16(e,6,0);
+    put16(e,8,files.length); put16(e,10,files.length);
+    put32(e,12,directorySize); put32(e,16,offset); put16(e,20,0);
+    return new Blob([...parts,...directory,end],{type:"application/zip"});
+}
+
 async function downloadAllDeckPDFs() {
     if(!deckEntries.length){alert("Korttilista on tyhjä.");return;}
+    if (currentDeckEntryId !== null) syncCurrentDeckDesignFromCanvas();
     if (!await ensureExportSafeLocalAssets()) return;
     decodedImageCache.clear();
     resetMainCanvasForCleanExport();
     const entries=getSortedDeckEntries();
     const env=makeDeckRenderEnvironment();
     const counts=new Map();
-    let dir=null;
-    if(typeof window.showDirectoryPicker==="function") {
-        try { dir=await window.showDirectoryPicker({mode:"readwrite"}); }
-        catch(e){ if(e?.name==="AbortError") return; }
-    }
+    const files=[];
+    const previousSuppress=suppressDeckSync;
     suppressDeckSync=true;
     try{
         for(let i=0;i<entries.length;i++){
@@ -7429,17 +7476,19 @@ async function downloadAllDeckPDFs() {
             const num=(counts.get(base)||0)+1; counts.set(base,num);
             const suffix=num>1?`_${num}`:"";
             const filename=`${base}${suffix}_63_5x88_9mm_300dpi_print.pdf`;
-            const blob=doc.output("blob");
-            if(dir){
-                const handle=await dir.getFileHandle(filename,{create:true});
-                const writable=await handle.createWritable(); await writable.write(blob); await writable.close();
-            }else{
-                const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),3000); await sleep(180);
-            }
+            files.push({filename,blob:doc.output("blob")});
+            if((i+1)%3===0) await new Promise(r=>setTimeout(r,0));
         }
-        setDeckStatus(`${entries.length} erillistä 300 dpi PDF:ää tehty.`);
+        setDeckStatus(`Pakataan ${files.length} PDF-tiedostoa ZIP-tiedostoon...`);
+        const zip=await makeStoredZipArchive(files);
+        const url=URL.createObjectURL(zip);
+        const a=document.createElement("a"); a.href=url;
+        a.download="korttilista_erilliset_300dpi_pdf.zip";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),60000);
+        setDeckStatus(`${files.length} erillistä 300 dpi PDF:ää ladattu yhtenä ZIP-pakettina.`);
     }catch(e){console.error(e);alert("Koko listan PDF-vienti epäonnistui: "+(e?.message||e));}
-    finally{ suppressDeckSync=false; await restoreDeckRenderEnvironment(env); }
+    finally{ suppressDeckSync=previousSuppress; await restoreDeckRenderEnvironment(env); }
 }
 
 async function downloadA4PDF() {
@@ -10146,37 +10195,18 @@ function keepDoubleFacedPairsSideBySide() {
         return new Blob([arr], {type:mime});
     }
 
-    async function saveBlobWithNativeDialog(blob, suggestedName, description, mime, extensions) {
-        // Oikea Save As -dialogi silloin kun selain tarjoaa File System Access API:n.
-        // Tämä EI anna sivulle mitään lähdekansion tiedostoja.
-        if (typeof window.showSaveFilePicker === "function") {
-            try {
-                const handle = await window.showSaveFilePicker({
-                    suggestedName,
-                    types: [{
-                        description: description || "File",
-                        accept: {[mime || blob.type || "application/octet-stream"]: extensions || []}
-                    }]
-                });
-                const writable = await handle.createWritable();
-                await writable.write(blob);
-                await writable.close();
-                return true;
-            } catch (e) {
-                if (e?.name === "AbortError") return false;
-                console.warn("Save-dialogi epäonnistui, käytetään selaimen downloadia:", e);
-            }
-        }
-
-        // Fallback: tavallinen selainlataus. Ei kansio-uploadia eikä tiedostojen lukemista.
+    async function saveBlobWithBrowserDownload(blob, suggestedName) {
+        // Tavallinen selaimen tiedostolataus. Ei showSaveFilePicker()-kutsua,
+        // ei kansion luku- tai kirjoitusoikeuksia eikä suojattujen kansioiden virheitä.
+        if (!(blob instanceof Blob) || !blob.size) throw new Error("Ladattava tiedosto on tyhjä.");
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
         a.download = suggestedName;
+        a.style.display = "none";
         document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        try { a.click(); }
+        finally { a.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000); }
         return true;
     }
 
@@ -10222,7 +10252,7 @@ function keepDoubleFacedPairsSideBySide() {
             const dataURL = canvas.toDataURL("image/png");
             const blob = dataURLToBlob(dataURL);
             const name = `${currentCardExportBaseName()}.png`;
-            await saveBlobWithNativeDialog(blob, name, "PNG image", "image/png", [".png"]);
+            await saveBlobWithBrowserDownload(blob, name, "PNG image", "image/png", [".png"]);
         } catch (e) {
             console.error("PNG tallennus epäonnistui:", e);
             const taint = e && (e.name === "SecurityError" || /taint|cross-origin|origin-clean/i.test(String(e.message || e)));
@@ -10246,7 +10276,7 @@ function keepDoubleFacedPairsSideBySide() {
             const doc = buildPrintPdfFromImageData(imgData);
             const blob = doc.output("blob");
             const name = `${currentCardExportBaseName()}_63_5x88_9mm_300dpi_print.pdf`;
-            await saveBlobWithNativeDialog(blob, name, "PDF document", "application/pdf", [".pdf"]);
+            await saveBlobWithBrowserDownload(blob, name, "PDF document", "application/pdf", [".pdf"]);
         } catch (e) {
             console.error("PDF tallennus epäonnistui:", e);
             const taint = e && (e.name === "SecurityError" || /taint|cross-origin|origin-clean/i.test(String(e.message || e)));
@@ -10297,7 +10327,7 @@ function keepDoubleFacedPairsSideBySide() {
                 if ((i+1) % 3 === 0) await new Promise(r => setTimeout(r, 0));
             }
             const blob = doc.output("blob");
-            const saved = await saveBlobWithNativeDialog(
+            const saved = await saveBlobWithBrowserDownload(
                 blob, "koko_korttilista_300dpi_print.pdf", "PDF document", "application/pdf", [".pdf"]
             );
             if (saved) setDeckStatus(uiText(
@@ -10354,70 +10384,51 @@ function keepDoubleFacedPairsSideBySide() {
         addA4CropMarks(doc, startX, startY, trimW, trimH);
     }
 
-    async function writeBlobToDirectory(dir, filename, blob) {
-        const handle = await dir.getFileHandle(filename, {create:true});
-        const writable = await handle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-    }
-
+    // Tulostus: yksi monisivuinen A4-PDF, 3 x 3 korttia per sivu.
+    // Tämä ei avaa Chromen suojattujen kansioiden valitsinta.
     window.downloadA4PDF = async function downloadA4PDF() {
         const {jsPDF} = window.jspdf || {};
         if (!jsPDF) { alert("jsPDF-kirjastoa ei löytynyt!"); return; }
+        if (deckLoadRunning || window.deckInteractionLoadingLock) {
+            alert(uiText("Odota, että korttilista on ladattu.", "Wait for the decklist to finish loading."));
+            return;
+        }
         if (!deckEntries.length) { alert("Korttilista on tyhjä."); return; }
         if (currentDeckEntryId !== null) syncCurrentDeckDesignFromCanvas();
-
         const entries = deckEntriesInVisibleOrder();
         const pageCount = Math.ceil(entries.length / 9);
         const env = makeDeckRenderEnvironment();
+        const previousSuppress = suppressDeckSync;
+        const a4Button = document.querySelector('button[onclick="downloadA4PDF()"]');
+        if(a4Button?.disabled) return;
+        if(a4Button) a4Button.disabled = true;
         suppressDeckSync = true;
-
         try {
-            // Ensisijainen toiminta: yksi KOHDEKANSION valinta, sitten kaikki A4:t
-            // automaattisesti samaan kansioon. Ei yhtä dialogia per sivu.
-            if (typeof window.showDirectoryPicker === "function") {
-                let dir;
-                try {
-                    dir = await window.showDirectoryPicker({mode:"readwrite"});
-                } catch (e) {
-                    if (e?.name === "AbortError") return;
-                    throw e;
-                }
-
-                for (let page = 0; page < pageCount; page++) {
-                    const cards = entries.slice(page*9, page*9+9);
-                    const doc = new jsPDF({orientation:"portrait", unit:"mm", format:"a4"});
-                    await renderA4PageIntoDoc(doc, cards, page*9, entries.length);
-                    const blob = doc.output("blob");
-                    const num = String(page+1).padStart(String(pageCount).length, "0");
-                    await writeBlobToDirectory(dir, `kortit_A4_${num}.pdf`, blob);
-                }
-                setDeckStatus(`A4 PDF:t tehty: ${entries.length} korttia / ${pageCount} A4-tiedostoa.`);
-                return;
-            }
-
-            // Jos selain ei salli kohdekansion kirjoitusta (esim. joissain file://-
-            // ympäristöissä), EI käytetä webkitdirectory/uploadia. Tehdään sen sijaan
-            // yksi monisivuinen A4-PDF ja kysytään tallennus vain kerran.
+            exportSafeLocalAssetMode = false;
+            decodedImageCache.clear();
             const doc = new jsPDF({orientation:"portrait", unit:"mm", format:"a4"});
             for (let page = 0; page < pageCount; page++) {
                 if (page > 0) doc.addPage("a4", "portrait");
                 await renderA4PageIntoDoc(doc, entries.slice(page*9, page*9+9), page*9, entries.length);
+                if ((page+1)%3===0) await new Promise(r => setTimeout(r,0));
             }
-            const blob = doc.output("blob");
-            await saveBlobWithNativeDialog(blob, "kortit_A4.pdf", "A4 PDF document", "application/pdf", [".pdf"]);
-            setDeckStatus(`A4 PDF tehty: ${entries.length} korttia / ${pageCount} A4-sivua.`);
+            await saveBlobWithBrowserDownload(doc.output("blob"), "korttilista_A4_tulostus.pdf");
+            setDeckStatus(`A4 PDF ladattu: ${entries.length} korttia / ${pageCount} A4-sivua. Tulosta 100 % koossa.`);
         } catch (e) {
             console.error("A4 PDF luonti epäonnistui:", e);
             const taint = e && (e.name === "SecurityError" || /taint|cross-origin|origin-clean/i.test(String(e.message || e)));
             alert(taint
-                ? "A4 PDF:n luominen estyi canvasin origin-clean-tilan takia. Ohjelma ei yritä enää avata tai uploadata mitään kansiota."
+                ? "A4 PDF:n luominen estyi kuvan käyttöoikeuksien takia: " + (e?.message || e)
                 : "A4 PDF:n luominen epäonnistui: " + (e?.message || e));
         } finally {
-            suppressDeckSync = false;
-            await restoreDeckRenderEnvironment(env);
+            try { await restoreDeckRenderEnvironment(env); }
+            finally {
+                suppressDeckSync = previousSuppress;
+                if(a4Button) a4Button.disabled = false;
+            }
         }
     };
+
 })();
 
 })();
