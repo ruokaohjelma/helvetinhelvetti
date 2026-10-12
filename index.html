@@ -775,6 +775,15 @@ body { padding: 10px; }
 .deck-remove-all-row{flex:0 0 auto;width:100%;box-sizing:border-box;padding:6px 0 0 0;}
 #deckDeleteAllBtn{width:100%;box-sizing:border-box;font-weight:bold;}
 </style>
+
+<style id="fullCardImageStyles">
+body.mtg-full-image-selected .menu-column > details.menu-section:not(:first-of-type) { display:none !important; }
+body.mtg-full-image-selected #editAllCardsButton,
+body.mtg-full-image-selected #editAllCardsNote,
+body.mtg-full-image-selected #duplicateGroupControl { display:none !important; }
+#fullCardImageNotice { box-sizing:border-box; display:none; width:400px; max-width:100%; background:#d4d0c8; border:2px inset #eee; color:#111; padding:7px; margin:7px 0; font:12px Arial,sans-serif; }
+body.mtg-full-image-selected #fullCardImageNotice {display:block;}
+</style>
 </head>
 
 <body>
@@ -827,6 +836,13 @@ Black Lotus"></textarea>
         </div>
 
         <button class="menu-button" type="button" onclick="openDeckListDialog()">LISÄÄ KORTTILISTA</button>
+
+        <div class="control-row" id="fullCardImagesControl">
+          <button type="button" class="menu-button" onclick="document.getElementById('fullCardImagesInput').click()">LISÄÄ VALMIITA KORTTIKUVIA (PNG/JPG)</button>
+          <input type="file" id="fullCardImagesInput" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" multiple style="display:none" onchange="importFinishedCardImages(event)">
+          <div class="small-note">Voit lisätä monta valmista korttikuvaa nykyisten korttien sekaan. Kuvia ei muokata, ja ne ovat mukana PDF- sekä A4-viennissä.</div>
+        </div>
+
         <div id="deckLoadStatus" class="deck-status" style="width:100%;margin:0 0 10px;">Ei korttilistaa ladattu.</div>
 
         <div class="compact-buttons">
@@ -1056,6 +1072,7 @@ Black Lotus"></textarea>
     <div id="editorView" class="editor-view">
       <div id="editorDeckToolbar" class="editor-deck-toolbar" style="display:none;"><button type="button" onclick="backToDeck()">◀ SULJE EDITORI</button></div>
       <canvas id="cardCanvas" width="1488" height="2079"></canvas>
+      <div id="fullCardImageNotice" role="note"></div>
       <button id="editorLockButton" type="button" style="display:none;" aria-pressed="false" onclick="toggleCurrentEditorLock()">LUKITSE</button>
       <label id="duplicateGroupControl" class="duplicate-group-control" style="display:none;">
         <input type="checkbox" id="duplicateGroupToggle" checked onchange="handleDuplicateGroupToggleChange()">
@@ -7144,6 +7161,7 @@ async function replaceSelectedDeckCard() {
             entry.name=canonical;
             entry.nameKey=newKey;
             entry.design=targetGroup.length && shouldLink ? targetGroup[0].design : made.design;
+            entry.rawImageData=null;entry.rawImageName=null;entry.rawImageType=null;
             entry.meta=cloneState(made.meta);
             entry.duplicateLinked=shouldLink;
             entry.locked=!!made.isBasicLand;
@@ -7195,6 +7213,9 @@ function duplicateSelectedDeckCard() {
         duplicateLinked: linked,
         locked: !!src.locked,
         originalState: cloneState(src.originalState || src.design?.state || {})
+        ,rawImageData: src.rawImageData || null,
+        rawImageName: src.rawImageName || null,
+        rawImageType: src.rawImageType || null
     };
     deckEntries.push(copy);
     // Jos ryhmä on linkitetty, varmista että kaikki saman nimen kopiot pysyvät linkitettyinä.
@@ -7955,6 +7976,17 @@ async function regenerateDeckThumbnails() {
         for (let i = 0; i < uniqueDesigns.length; i++) {
             const { design, entry } = uniqueDesigns[i];
             setDeckStatus(`Thumbnail-laatu: ${i + 1}/${uniqueDesigns.length} · ${entry.name}`);
+            if (entry.rawImageData) {
+                const img = await new Promise((resolve, reject) => { const x=new Image(); x.onload=()=>resolve(x);x.onerror=()=>reject(new Error('Korttikuvaa ei voitu ladata.'));x.src=entry.rawImageData; });
+                const q=getDeckThumbnailQualityConfig();
+                const preview=document.createElement('canvas'); preview.width=q.width; preview.height=q.height;
+                const c=preview.getContext('2d'); c.fillStyle='#fff';c.fillRect(0,0,q.width,q.height);
+                const z=Math.min(q.width/img.naturalWidth,q.height/img.naturalHeight);
+                c.drawImage(img,(q.width-img.naturalWidth*z)/2,(q.height-img.naturalHeight*z)/2,img.naturalWidth*z,img.naturalHeight*z);
+                design.thumb=preview.toDataURL('image/jpeg',q.jpeg);
+                design.thumbCanvas=null;design.exportError=null;
+                continue;
+            }
             restoreEditorState(design.state);
             await generateCard();
             const assets = captureCanvasAssets();
@@ -8252,6 +8284,9 @@ async function restoreProjectData(data) {
                 pairFaceIndex: Number.isInteger(saved.pairFaceIndex) ? saved.pairFaceIndex : null,
                 pairSize: Number.isInteger(saved.pairSize) ? saved.pairSize : null,
                 parentCardName: saved.parentCardName || null
+                ,rawImageData: saved.rawImageData || null,
+                rawImageName: saved.rawImageName || null,
+                rawImageType: saved.rawImageType || null
             });
         }
 
@@ -10543,7 +10578,7 @@ async function copyCurrentSettingsToAllCardsOnce() {
     const seen = new Set();
     for (const entry of deckEntries) {
         const design = entry?.design;
-        if (!design || design === currentEntry.design || seen.has(design) || lockedDesigns.has(design)) continue;
+        if (entry.rawImageData || !design || design === currentEntry.design || seen.has(design) || lockedDesigns.has(design)) continue;
         seen.add(design);
         targets.push({design, entry});
     }
@@ -10613,6 +10648,292 @@ refreshDynamicUILanguage = function() {
 
 // Tämä versio on tarkoitettu localhostiin tai HTTPS:ään. file:// ei ole tuettu
 // export-käyttöön; näin vältetään kaikki paikallisten assettien raskaat workaroundit.
+</script>
+
+
+<script id="fullCardImagesSupport">
+// Kokonaiset kuvakortit: ei Scryfall-hakua, tekstikerroksia eikä frame-piirtoa.
+// Alkuperäinen image data tallennetaan projektin mukana ja kortteja
+// renderöidään PDF:iin samaan resoluutioon kuin normaalit kortit.
+(function installFullCardImageSupport() {
+  const $ = id => document.getElementById(id);
+  let printingFullImage = false;
+  let importingImages = false;
+  const isRaw = entry => !!entry?.rawImageData;
+  const rawCurrent = () => deckEntries.find(e => e.id === currentDeckEntryId && isRaw(e)) || null;
+  const imageName = filename => String(filename||'Korttikuva').replace(/\.[^.]+$/, '').trim() || 'Korttikuva';
+
+  function fileAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result||''));
+      r.onerror = () => reject(r.error || new Error('Tiedoston lukeminen epäonnistui.'));
+      r.readAsDataURL(file);
+    });
+  }
+  function loadFullCardImage(src) {
+    return new Promise((resolve,reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Korttikuvaa ei voitu avata.'));
+      img.src = src;
+    });
+  }
+  function drawUnchangedImage(image, dest) {
+    const c = dest.getContext('2d');
+    if (!c) throw new Error('Canvas ei ole käytettävissä.');
+    c.save();
+    c.globalAlpha = 1;
+    c.globalCompositeOperation = 'source-over';
+    c.filter = 'none';
+    c.clearRect(0,0,dest.width,dest.height);
+    c.fillStyle = '#ffffff';
+    c.fillRect(0,0,dest.width,dest.height);
+    // Sovitetaan koko kuva leikkaamatta tai lisäämättä tekstejä/kehyksiä.
+    const s = Math.min(dest.width/image.naturalWidth, dest.height/image.naturalHeight);
+    const w = image.naturalWidth*s, h = image.naturalHeight*s;
+    c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+    c.drawImage(image, (dest.width-w)/2, (dest.height-h)/2, w, h);
+    c.restore();
+  }
+  async function rawCardPng(entry, w=744, h=1039) {
+    try {
+      const img = await loadFullCardImage(entry.rawImageData);
+      const temp = document.createElement('canvas');
+      temp.width = w; temp.height = h;
+      drawUnchangedImage(img,temp);
+      return temp.toDataURL('image/png');
+    } catch(err) {
+      throw new Error(`Kortti '${entry.name}': ${err?.message||err}`);
+    }
+  }
+  async function showRawCard(entry) {
+    const img = await loadFullCardImage(entry.rawImageData);
+    canvas.width = 1488; canvas.height = 2079;
+    drawUnchangedImage(img, canvas);
+    document.body.classList.add('mtg-full-image-selected');
+    const note = $('fullCardImageNotice');
+    if(note) note.textContent = uiText(
+      `VALMIS KORTTIKUVA — ${entry.name}. Tätä kuvaa ei muokata.`,
+      `FINISHED CARD IMAGE — ${entry.name}. This image is not editable.`
+    );
+  }
+  function hideRawCard() {document.body.classList.remove('mtg-full-image-selected');}
+
+  window.importFinishedCardImages = async function(event) {
+    const input = event?.target || $('fullCardImagesInput');
+    const files = Array.from(input?.files || []);
+    if(!files.length || importingImages) return;
+    if (deckLoadRunning || window.deckInteractionLoadingLock) {
+      alert(uiText('Odota, että korttilista valmistuu.', 'Wait until the decklist has finished loading.'));
+      if(input) input.value = '';
+      return;
+    }
+    const allowed = new Set(['image/png','image/jpeg','image/webp']);
+    const errors=[];
+    const newEntries=[];
+    importingImages=true;
+    if(input) input.disabled=true;
+    try {
+      if(currentDeckEntryId!==null) syncCurrentDeckDesignFromCanvas();
+      const savedState = captureEditorState();
+      for(const file of files) {
+        try {
+          if(!allowed.has(file.type) && !/\.(png|jpe?g|webp)$/i.test(file.name))
+            throw new Error('Tuettuja ovat PNG, JPG ja WEBP.');
+          if(file.size > 45*1024*1024) throw new Error('Kuvatiedoston enimmäiskoko on 45 Mt.');
+          const src=await fileAsDataURL(file);
+          const img=await loadFullCardImage(src);
+          if(!img.naturalWidth || !img.naturalHeight) throw new Error('Kuvan mittoja ei tunnistettu.');
+          const q=getDeckThumbnailQualityConfig();
+          const preview=document.createElement('canvas');
+          preview.width=q.width; preview.height=q.height;
+          drawUnchangedImage(img, preview);
+          const name=imageName(file.name);
+          const design={
+            id:designCounter++, state:cloneState(savedState),
+            printImg:null, thumb:preview.toDataURL('image/jpeg',q.jpeg),
+            thumbCanvas:null, snapshotCanvas:null, exportError:null
+          };
+          const entry={
+            id:entryCounter++, name, nameKey:normalizeCardName(name), copyNumber:1,
+            design, meta:{name,colors:[],typeLine:'',manaValue:0,manaCost:''},
+            duplicateLinked:false, locked:true, originalState:cloneState(savedState),
+            rawImageData:src, rawImageName:file.name, rawImageType:file.type||'image/png',
+            pairId:null, pairFaceIndex:null, pairSize:null, parentCardName:null
+          };
+          deckEntries.push(entry); newEntries.push(entry);
+          setDeckStatus(`Lisätään korttikuvia: ${newEntries.length}/${files.length}`);
+        } catch(e) {errors.push(`${file.name}: ${e?.message||e}`);}
+        if(newEntries.length % 5===0) await new Promise(r=>setTimeout(r,0));
+      }
+      // Thumbnail-listan järjestys ja scrollTop pysyvät ennallaan.
+      syncDeckStableOrder();
+      if(newEntries.length) {
+        selectedDeckEntryId=newEntries[newEntries.length-1].id;
+        showDeckView();
+        renderDeckGrid();
+        rememberCurrentDeckList();
+      }
+      setDeckStatus(`${newEntries.length} valmista korttikuvaa lisätty · ${deckEntries.length} korttia yhteensä.${errors.length?' Virheitä: '+errors.join(' | '):''}`,errors.length>0);
+      if(errors.length) alert(errors.join('\n'));
+    } finally {
+      importingImages=false;
+      if(input) {input.value=''; input.disabled=false;}
+    }
+  };
+
+  const openOriginal = openDeckCard;
+  openDeckCard = async function(id) {
+    const entry=deckEntries.find(e=>e.id===id);
+    if (!isRaw(entry)) {
+      hideRawCard();
+      return openOriginal(id);
+    }
+    if(deckSyncTimer) {clearTimeout(deckSyncTimer);deckSyncTimer=null;}
+    if(currentDeckEntryId!==null && currentDeckEntryId!==id) syncCurrentDeckDesignFromCanvas();
+    selectedDeckEntryId=entry.id; currentDeckEntryId=entry.id;
+    const wasSuppress=suppressDeckSync; suppressDeckSync=true;
+    try {
+      showEditorView();
+      await showRawCard(entry);
+      updateDuplicateEditorUI(); updateEditorCardNav(); updateDeckLockUI();
+      renderDeckGrid();
+    } finally {suppressDeckSync=wasSuppress;}
+  };
+
+  const originalSync=syncCurrentDeckDesignFromCanvas;
+  syncCurrentDeckDesignFromCanvas=function(...args) {
+    if(rawCurrent()) return;
+    return originalSync(...args);
+  };
+  const originalRestoreEnvironment=restoreDeckRenderEnvironment;
+  restoreDeckRenderEnvironment=async function(env) {
+    const target=deckEntries.find(e=>e.id===env?.currentId && isRaw(e));
+    if(target && env.editorVisible) {
+      const wasSuppress=suppressDeckSync; suppressDeckSync=true;
+      try {
+        restoreEditorState(env.state);
+        currentDeckEntryId=target.id; selectedDeckEntryId=env.selectedId;
+        showEditorView();
+        await showRawCard(target);
+      } finally {suppressDeckSync=wasSuppress;}
+      renderDeckGrid(); updateEditorCardNav();
+      return;
+    }
+    await originalRestoreEnvironment(env);
+    hideRawCard();
+  };
+  const originalBackToDeck=backToDeck;
+  backToDeck=async function(...args) {
+    const res=await originalBackToDeck(...args);
+    hideRawCard();
+    return res;
+  };
+
+  // Kuvakortti tuodaan samoille 300 dpi -kuvamitoille kuin muut kortit.
+  // Merkki estää editorin CMYK-reunojen lisäämisen valmiisiin kuviin.
+  const normalRender=renderDeckEntryToPngData;
+  renderDeckEntryToPngData=async function(entry,w=744,h=1039) {
+    printingFullImage=isRaw(entry);
+    if(printingFullImage) return rawCardPng(entry,w,h);
+    return normalRender(entry,w,h);
+  };
+  const normalBorder=addPdfBorderOverlayIfNeeded;
+  addPdfBorderOverlayIfNeeded=function(...args) {
+    if(printingFullImage) return;
+    return normalBorder(...args);
+  };
+
+  const normalGifDraw=drawDeckEntryForGif;
+  drawDeckEntryForGif=async function(entry,targetCanvas) {
+    if (!isRaw(entry)) return normalGifDraw(entry,targetCanvas);
+    const img=await loadFullCardImage(entry.rawImageData);
+    drawUnchangedImage(img,targetCanvas);
+  };
+
+  const pngOriginal=window.downloadPNG;
+  const pdfOriginal=window.downloadPDF;
+  function downloadOriginalImage(entry) {
+    const blobParts=String(entry.rawImageData||'').split(',');
+    const b64=blobParts[1]||'';
+    const bytes=atob(b64);
+    const chunks=[];
+    for(let i=0;i<bytes.length;i+=32768) {
+      const b=new Uint8Array(Math.min(32768,bytes.length-i));
+      for(let j=0;j<b.length;j++) b[j]=bytes.charCodeAt(i+j);
+      chunks.push(b);
+    }
+    const blob=new Blob(chunks,{type:entry.rawImageType||'image/png'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download=entry.rawImageName||`${safePdfBaseName(entry.name)}.png`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),15000);
+  }
+  window.downloadPNG=async function(...args) {
+    const entry=rawCurrent();
+    if(entry){downloadOriginalImage(entry);return;}
+    printingFullImage=false;
+    return pngOriginal(...args);
+  };
+  window.downloadPDF=async function(...args) {
+    const entry=rawCurrent();
+    if(!entry){printingFullImage=false;return pdfOriginal(...args);}
+    try {
+      const img=await renderDeckEntryToPngData(entry,744,1039);
+      const doc=buildPrintPdfFromImageData(img);
+      const blob=doc.output('blob');
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement('a');
+      a.href=url; a.download=`${safePdfBaseName(entry.name)}_300dpi_print.pdf`;
+      document.body.appendChild(a);a.click();a.remove();
+      setTimeout(()=>URL.revokeObjectURL(url),15000);
+    } catch(e){alert('PDF-vienti epäonnistui: '+(e?.message||e));}
+  };
+
+  // Projektin mukana säilytetään myös alkuperäiset täydet kuvabytesit.
+  const originalBuildProject=buildProjectData;
+  buildProjectData=function() {
+    const data=originalBuildProject();
+    for(let i=0;i<data.entries.length;i++) {
+      const entry=deckEntries[i];
+      if(isRaw(entry)) {
+        data.entries[i].rawImageData=entry.rawImageData;
+        data.entries[i].rawImageName=entry.rawImageName;
+        data.entries[i].rawImageType=entry.rawImageType;
+      }
+    }
+    return data;
+  };
+
+  // Pelkän korttinimilistan palautus ei voi palauttaa paikallista kuvafileä.
+  // Kuvakortit jäävät siksi pois muistissa olevasta nimilistasta; projektifile
+  // sen sijaan sisältää ne kokonaisina.
+  deckEntriesToDeckListText=function() {
+    const grouped=new Map();
+    for(const entry of deckEntries) {
+      if(isRaw(entry)) continue;
+      const name=String(entry?.name||'').trim();
+      if(!name) continue;
+      const key=normalizeCardName(name);
+      if(!grouped.has(key)) grouped.set(key,{name,count:0});
+      grouped.get(key).count++;
+    }
+    return [...grouped.values()].map(x=>`${x.count} ${x.name}`).join('\n');
+  };
+
+  const oldClearDeck=clearDeckList;
+  clearDeckList=function(...args) {hideRawCard();return oldClearDeck(...args);};
+  const oldDeleteSelected=deleteSelectedDeckCard;
+  deleteSelectedDeckCard=function(...args) {
+    const current=rawCurrent();
+    const selected=selectedDeckEntryId;
+    const out=oldDeleteSelected(...args);
+    if(current?.id===selected) hideRawCard();
+    return out;
+  };
+})();
 </script>
 
 </body>
