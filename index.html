@@ -1598,8 +1598,25 @@ function getRulesTextSource() {
     return document.querySelector('input[name="rulesTextSource"]:checked')?.value || "printed";
 }
 
+// Erotellaan virheellisesti yhteen aaltosulkuun joutuneet tavalliset
+// manasymbolit. Aidot hybridit {W/U}, {2/U}, {U/P} ym. säilyvät ennallaan.
+// Sääntötekstin esimerkki: {1U} -> {1} {U}, {2BG} -> {2} {B} {G}.
+function normalizeCombinedManaBraces(text, rulesOnly=false) {
+    return String(text ?? "").split(/(\r?\n)/).map((line, index, lines) => {
+        // Ensimmäisellä editoririvillä on casting cost; jätetään symbolit vierekkäin.
+        const isFirstLine = !rulesOnly && lines.slice(0, index).every(p => p !== "\n" && p !== "\r\n");
+        return line.replace(/\{([^{}\r\n]+)\}/g, (whole, body) => {
+            const source = String(body).trim().toUpperCase();
+            if (!/^(?:\d+|[WUBRGCXST])+$/.test(source)) return whole;
+            const symbols = source.match(/\d+|[WUBRGCXST]/g);
+            if (!symbols || symbols.length < 2 || symbols.join("") !== source) return whole;
+            return symbols.map(v => `{${v}}`).join(isFirstLine ? "" : " ");
+        });
+    }).join("");
+}
+
 function replaceColorlessSymbolsWithWords(rules) {
-    return String(rules || "")
+    return normalizeCombinedManaBraces(rules || "", true)
         .replace(/\{C\}\{C\}\{C\}/g, "three colorless mana")
         .replace(/\{C\}\{C\}/g, "two colorless mana")
         .replace(/\{C\}/g, "one colorless mana");
@@ -1610,17 +1627,17 @@ function getRulesTextForResult(result, sourceMode = getRulesTextSource()) {
 
     const oracleText = result.oracleRulesText ?? result.oracle?.oracle_text ?? result.oracle?.text ?? "";
     if (sourceMode === "printed") {
-        if (typeof result.printedRulesText === "string") return result.printedRulesText;
+        if (typeof result.printedRulesText === "string") return normalizeCombinedManaBraces(result.printedRulesText, true);
         return oracleText;
     }
-    return oracleText;
+    return normalizeCombinedManaBraces(oracleText, true);
 }
 
 function buildRulesVariantData(result) {
     if (!result) return null;
     return {
-        oracle: result.oracleRulesText ?? result.oracle?.oracle_text ?? result.oracle?.text ?? "",
-        printed: typeof result.printedRulesText === "string" ? result.printedRulesText : null,
+        oracle: normalizeCombinedManaBraces(result.oracleRulesText ?? result.oracle?.oracle_text ?? result.oracle?.text ?? "", true),
+        printed: typeof result.printedRulesText === "string" ? normalizeCombinedManaBraces(result.printedRulesText, true) : null,
         oracleType: result.oracleTypeLine ?? result.oracle?.type_line ?? result.oracle?.type ?? "",
         printedType: typeof result.printedTypeLine === "string" && result.printedTypeLine ? result.printedTypeLine : null,
         // Flavor seuraa MODERNI/VANHA-valintaa erikseen. VANHA käyttää
@@ -3115,6 +3132,13 @@ function drawTextWithSpacing(ctx, text, x, y, letterSpacing = 0) {
 
 
 async function generateCard() {
+    // Myös vanhoista projekteista tulevat yhdistetyt manasymbolit korjataan
+    // ennen renderöintiä, automaattista tekstikoon sovitusta ja PDF-vientiä.
+    const manaInput = document.getElementById("input");
+    if (manaInput) {
+        const normalized = normalizeCombinedManaBraces(manaInput.value);
+        if (normalized !== manaInput.value) manaInput.value = normalized;
+    }
     // MAHDOLLISIMMAN ISO TEKSTI on tila, ei kertapainike. Kun se on päällä,
     // sovita layout uudelleen aina ennen renderöintiä.
     const maxTextToggle = document.getElementById("maximizeRulesTextToggle");
@@ -5392,7 +5416,7 @@ function restoreEditorState(state) {
         const el = document.getElementById(id);
         if (!el) continue;
         if (saved.kind === "checked") el.checked = !!saved.value;
-        else el.value = saved.value ?? "";
+        else el.value = id === "input" ? normalizeCombinedManaBraces(saved.value ?? "") : (saved.value ?? "");
     }
 
     document.querySelectorAll('input[name="setSymbol"]').forEach(radio => {
@@ -5434,7 +5458,7 @@ function restoreEditorState(state) {
     window.tallennettuTaide = state.tallennettuTaide || null;
     window.tallennettuSetSymboli = state.tallennettuSetSymboli || null;
     window.onkoSuomennos = !!state.onkoSuomennos;
-    window.translationEnglishInput = typeof state.translationEnglishInput === "string" ? state.translationEnglishInput : (state.fields?.input?.value || "");
+    window.translationEnglishInput = normalizeCombinedManaBraces(typeof state.translationEnglishInput === "string" ? state.translationEnglishInput : (state.fields?.input?.value || ""));
     window.translationEnglishFlavor = typeof state.translationEnglishFlavor === "string" ? state.translationEnglishFlavor : (state.fields?.flavorInput?.value || "");
     updateTranslationButton();
     updateWhiteBorderValueLabels();
@@ -10419,47 +10443,162 @@ function keepDoubleFacedPairsSideBySide() {
         addA4CropMarks(doc, startX, startY, trimW, trimH);
     }
 
-    // Tulostus: yksi monisivuinen A4-PDF, 3 x 3 korttia per sivu.
-    // Tämä ei avaa Chromen suojattujen kansioiden valitsinta.
+    // A4 PDF: 9 korttia per sivu, täsmälleen aiemmat PNG- ja mitta-asetukset.
+    // Sivut renderöidään ensin ERIKSEEN jsPDF:llä ja yhdistetään sen jälkeen
+    // yhdeksi PDF:ksi pdf-lib-kirjastolla. Kirjasto ei muuta upotettuja
+    // korttikuvia eikä lisää JPEG-pakkausta. Näin vältetään jsPDF:n
+    // suuren dokumentin Array.join / Invalid string length -virhe.
+    async function ensureA4PdfMergeLibrary() {
+        if (window.PDFLib?.PDFDocument) return window.PDFLib;
+        if (window.__mtgPdfLibLoadingPromise) return window.__mtgPdfLibLoadingPromise;
+        const urls = [
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js',
+            'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js',
+            'https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js'
+        ];
+        window.__mtgPdfLibLoadingPromise = (async () => {
+            let failure = null;
+            for (const url of urls) {
+                try {
+                    await new Promise((resolve, reject) => {
+                        const script = document.createElement('script');
+                        script.src = url;
+                        script.async = true;
+                        const timer = setTimeout(() => {
+                            script.onload = script.onerror = null;
+                            script.remove();
+                            reject(new Error('PDF-yhdistämiskirjaston lataus aikakatkaistiin.'));
+                        }, 15000);
+                        script.onload = () => {clearTimeout(timer); resolve();};
+                        script.onerror = () => {clearTimeout(timer);script.remove();reject(new Error('Kirjaston lataus epäonnistui: '+url));};
+                        document.head.appendChild(script);
+                    });
+                    if (window.PDFLib?.PDFDocument) return window.PDFLib;
+                    throw new Error('PDF-yhdistämiskirjasto ei käynnistynyt.');
+                } catch (e) { failure = e; }
+            }
+            throw failure || new Error('PDF-yhdistämiskirjastoa ei löydy.');
+        })();
+        try {return await window.__mtgPdfLibLoadingPromise;}
+        finally { window.__mtgPdfLibLoadingPromise = null; }
+    }
+
+    // Kirjoitetaan yksi yksisivuinen A4-PDF kerrallaan. Kuvan renderöinti,
+    // CMYK-reunat ja leikkausmerkit käyttävät täsmälleen aiempia funktioita.
+    async function buildOneA4PageBlob(entries, page, totalCards) {
+        const {jsPDF} = window.jspdf;
+        const doc = new jsPDF({orientation:'portrait', unit:'mm', format:'a4'});
+        await renderA4PageIntoDoc(doc, entries.slice(page*9, page*9+9), page*9, totalCards);
+        const blob = doc.output('blob');
+        if (!(blob instanceof Blob) || !blob.size) {
+            throw new Error(`A4-sivun ${page+1} PDF muodostui tyhjäksi.`);
+        }
+        return blob;
+    }
+
+    // Jos pdf-lib puuttuu / yhdistäminen epäonnistuu, kortteja ei hukata:
+    // tehdään erilliset A4-PDF:t yhteen pakkaamattomaan ZIPiin (ei laatumuutoksia).
+    async function exportA4AsZipFallback(entries, pageCount) {
+        const files = [];
+        const digits = Math.max(3, String(pageCount).length);
+        try {
+            for (let page=0; page<pageCount; page++) {
+                setDeckStatus(`Varavienti: A4 ${page+1}/${pageCount} (ZIP)`);
+                const blob = await buildOneA4PageBlob(entries, page, entries.length);
+                files.push({filename:`korttilista_A4_${String(page+1).padStart(digits,'0')}.pdf`,blob});
+                decodedImageCache.clear();
+                if ((page+1)%2===0) await new Promise(r=>setTimeout(r,0));
+            }
+            if (files.length === 1) {
+                await saveBlobWithBrowserDownload(files[0].blob,'korttilista_A4_tulostus.pdf');
+            } else {
+                const zip = await makeStoredZipArchive(files);
+                if (!zip?.size) throw new Error('ZIP-tiedosto muodostui tyhjäksi.');
+                await saveBlobWithBrowserDownload(zip,'korttilista_A4_tulostus_PDFt.zip');
+            }
+            setDeckStatus(`Varavienti valmis: ${entries.length} korttia / ${pageCount} A4-sivua ZIP-paketissa. Tulosta 100 % koossa.`);
+        } finally { files.length=0; }
+    }
+
     window.downloadA4PDF = async function downloadA4PDF() {
         const {jsPDF} = window.jspdf || {};
-        if (!jsPDF) { alert("jsPDF-kirjastoa ei löytynyt!"); return; }
+        if (!jsPDF) { alert('jsPDF-kirjastoa ei löytynyt!'); return; }
         if (deckLoadRunning || window.deckInteractionLoadingLock) {
-            alert(uiText("Odota, että korttilista on ladattu.", "Wait for the decklist to finish loading."));
+            alert(uiText('Odota, että korttilista on ladattu.','Wait for the decklist to finish loading.'));
             return;
         }
-        if (!deckEntries.length) { alert("Korttilista on tyhjä."); return; }
+        if (!deckEntries.length) { alert('Korttilista on tyhjä.');return; }
         if (currentDeckEntryId !== null) syncCurrentDeckDesignFromCanvas();
         const entries = deckEntriesInVisibleOrder();
-        const pageCount = Math.ceil(entries.length / 9);
+        const pageCount = Math.ceil(entries.length/9);
         const env = makeDeckRenderEnvironment();
         const previousSuppress = suppressDeckSync;
         const a4Button = document.querySelector('button[onclick="downloadA4PDF()"]');
-        if(a4Button?.disabled) return;
-        if(a4Button) a4Button.disabled = true;
-        suppressDeckSync = true;
+        if (a4Button?.disabled) return;
+        if (a4Button) a4Button.disabled=true;
+        suppressDeckSync=true;
+        let mergedPdf=null;
+        let pagePdf=null;
+        let mergeError=null;
         try {
-            exportSafeLocalAssetMode = false;
+            exportSafeLocalAssetMode=false;
             decodedImageCache.clear();
-            const doc = new jsPDF({orientation:"portrait", unit:"mm", format:"a4"});
-            for (let page = 0; page < pageCount; page++) {
-                if (page > 0) doc.addPage("a4", "portrait");
-                await renderA4PageIntoDoc(doc, entries.slice(page*9, page*9+9), page*9, entries.length);
-                if ((page+1)%3===0) await new Promise(r => setTimeout(r,0));
+            // Yhden sivun vienti ei tarvitse yhdistämiskirjastoa eikä verkkoa.
+            if (pageCount===1) {
+                const blob=await buildOneA4PageBlob(entries,0,entries.length);
+                await saveBlobWithBrowserDownload(blob,'korttilista_A4_tulostus.pdf');
+            } else {
+                let library;
+                try {
+                    setDeckStatus(`Valmistellaan ${pageCount} A4-sivun yhdistämistä...`);
+                    library=await ensureA4PdfMergeLibrary();
+                    mergedPdf=await library.PDFDocument.create();
+                    mergedPdf.setTitle('MTG-korttilista A4');
+                    mergedPdf.setProducer('MTG-ohjelma');
+                    for (let page=0; page<pageCount; page++) {
+                        setDeckStatus(`A4: luodaan ja yhdistetään arkki ${page+1}/${pageCount} (${entries.length} korttia)`);
+                        const blob=await buildOneA4PageBlob(entries,page,entries.length);
+                        // Vain yksi jsPDF-sivu kerrallaan. Sen raakadataa ei jätetä
+                        // files[]-taulukkoon eikä pidetä jsPDF-oliota hengissä.
+                        pagePdf=await library.PDFDocument.load(await blob.arrayBuffer(),{updateMetadata:false});
+                        const pages=await mergedPdf.copyPages(pagePdf,[0]);
+                        mergedPdf.addPage(pages[0]);
+                        pagePdf=null;
+                        decodedImageCache.clear();
+                        if ((page+1)%2===0) await new Promise(r=>setTimeout(r,0));
+                    }
+                    if (mergedPdf.getPageCount()!==pageCount) throw new Error('Yhdistetyn PDF:n sivumäärä ei täsmää.');
+                    setDeckStatus(`Kootaan ${pageCount} A4-sivua yhdeksi PDF:ksi...`);
+                    // PDF:n objektivirrat jätetään pois laajan tulostinyhteensopivuuden
+                    // vuoksi. PNG-korttien alkuperäistä pakkausta EI muuteta.
+                    const bytes=await mergedPdf.save({useObjectStreams:false,objectsPerTick:50});
+                    const result=new Blob([bytes],{type:'application/pdf'});
+                    if (!result.size) throw new Error('Yhdistetty PDF muodostui tyhjäksi.');
+                    await saveBlobWithBrowserDownload(result,'korttilista_A4_tulostus.pdf');
+                } catch (e) {
+                    mergeError=e;
+                    console.warn('Yksi A4-PDF ei onnistunut, käytetään PDF/ZIP-varavientiä:',e);
+                } finally {mergedPdf=null;pagePdf=null;}
+                if (mergeError) {
+                    setDeckStatus('Yhdistäminen epäonnistui. Tehdään varmuudeksi erilliset A4-PDF:t ZIPiin...');
+                    decodedImageCache.clear();
+                    await new Promise(r=>setTimeout(r,0));
+                    await exportA4AsZipFallback(entries,pageCount);
+                    alert('Yhden suuren A4-PDF:n muodostaminen ei onnistunut ('+(mergeError?.message||mergeError)+'). Kortit ladattiin sen sijaan A4-PDF-tiedostoina ZIP-paketissa. Kuvien laatua tai tulostusmittoja ei muutettu.');
+                }
             }
-            await saveBlobWithBrowserDownload(doc.output("blob"), "korttilista_A4_tulostus.pdf");
-            setDeckStatus(`A4 PDF ladattu: ${entries.length} korttia / ${pageCount} A4-sivua. Tulosta 100 % koossa.`);
+            if (pageCount===1 || !mergeError) {
+                setDeckStatus(`A4 PDF ladattu: ${entries.length} korttia / ${pageCount} sivua yhdessä PDF:ssä. Tulosta 100 % koossa.`);
+            }
         } catch (e) {
-            console.error("A4 PDF luonti epäonnistui:", e);
-            const taint = e && (e.name === "SecurityError" || /taint|cross-origin|origin-clean/i.test(String(e.message || e)));
-            alert(taint
-                ? "A4 PDF:n luominen estyi kuvan käyttöoikeuksien takia: " + (e?.message || e)
-                : "A4 PDF:n luominen epäonnistui: " + (e?.message || e));
+            console.error('A4 PDF-vienti epäonnistui:',e);
+            alert('A4 PDF:n luominen epäonnistui: '+(e?.message||e));
         } finally {
+            mergedPdf=null;pagePdf=null;
             try { await restoreDeckRenderEnvironment(env); }
             finally {
-                suppressDeckSync = previousSuppress;
-                if(a4Button) a4Button.disabled = false;
+                suppressDeckSync=previousSuppress;
+                if (a4Button) a4Button.disabled=false;
             }
         }
     };
